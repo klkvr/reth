@@ -113,7 +113,7 @@ where
 
     /// Process block response.
     /// Returns an error if the response is invalid.
-    fn on_block_response(&mut self, response: WithPeerId<Vec<BlockBody>>) -> DownloadResult<()> {
+    fn on_block_response(&mut self, response: WithPeerId<Vec<B::Body>>) -> DownloadResult<()> {
         let (peer_id, bodies) = response.split();
         let request_len = self.last_request_len.unwrap_or_default();
         let response_len = bodies.len();
@@ -156,7 +156,7 @@ where
     ///
     /// This method removes headers from the internal collection.
     /// If the response fails validation, then the header will be put back.
-    fn try_buffer_blocks(&mut self, bodies: Vec<BlockBody>) -> DownloadResult<()> {
+    fn try_buffer_blocks(&mut self, bodies: Vec<B::Body>) -> DownloadResult<()> {
         let bodies_capacity = bodies.capacity();
         let bodies_len = bodies.len();
         let mut bodies = bodies.into_iter().peekable();

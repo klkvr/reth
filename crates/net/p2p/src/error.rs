@@ -1,6 +1,7 @@
 use std::ops::RangeInclusive;
 
 use reth_consensus::ConsensusError;
+use reth_eth_wire_types::BlockHeader;
 use reth_network_peers::WithPeerId;
 use reth_primitives::{
     BlockHashOrNumber, BlockNumber, GotExpected, GotExpectedBoxed, Header, B256,
@@ -27,7 +28,7 @@ pub trait EthResponseValidator {
     fn reputation_change_err(&self) -> Option<ReputationChangeKind>;
 }
 
-impl EthResponseValidator for RequestResult<Vec<Header>> {
+impl<H: BlockHeader> EthResponseValidator for RequestResult<Vec<H>> {
     fn is_likely_bad_headers_response(&self, request: &HeadersRequest) -> bool {
         match self {
             Ok(headers) => {
@@ -40,7 +41,7 @@ impl EthResponseValidator for RequestResult<Vec<Header>> {
                 match request.start {
                     BlockHashOrNumber::Number(block_number) => headers
                         .first()
-                        .map(|header| block_number != header.number)
+                        .map(|header| block_number != header.number())
                         .unwrap_or_default(),
                     BlockHashOrNumber::Hash(_) => {
                         // we don't want to hash the header

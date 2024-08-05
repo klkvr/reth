@@ -91,9 +91,9 @@ pub struct ReverseHeadersDownloader<H: HeadersClient> {
     ///
     /// This will give us the block number of the `sync_target`, after which we can send multiple
     /// requests at a time.
-    sync_target_request: Option<HeadersRequestFuture<H::Output>>,
+    sync_target_request: Option<HeadersRequestFuture<H::Output, H::Header>>,
     /// requests in progress
-    in_progress_queue: FuturesUnordered<HeadersRequestFuture<H::Output>>,
+    in_progress_queue: FuturesUnordered<HeadersRequestFuture<H::Output, H::Header>>,
     /// Buffered, unvalidated responses
     buffered_responses: BinaryHeap<OrderedHeadersResponse>,
     /// Buffered, _sorted_ and validated headers ready to be returned.
@@ -242,7 +242,7 @@ where
     fn process_next_headers(
         &mut self,
         request: HeadersRequest,
-        headers: Vec<Header>,
+        headers: Vec<H::Header>,
         peer_id: PeerId,
     ) -> Result<(), ReverseHeadersDownloaderError> {
         let mut validated = Vec::with_capacity(headers.len());
@@ -350,7 +350,7 @@ where
     /// Handles the response for the request for the sync target
     fn on_sync_target_outcome(
         &mut self,
-        response: HeadersRequestOutcome,
+        response: HeadersRequestOutcome<H>,
     ) -> Result<(), ReverseHeadersDownloaderError> {
         let sync_target = self.existing_sync_target();
         let HeadersRequestOutcome { request, outcome } = response;
@@ -427,7 +427,7 @@ where
     /// Invoked when we received a response
     fn on_headers_outcome(
         &mut self,
-        response: HeadersRequestOutcome,
+        response: HeadersRequestOutcome<H::Header>,
     ) -> Result<(), ReverseHeadersDownloaderError> {
         let requested_block_number = response.block_number();
         let HeadersRequestOutcome { request, outcome } = response;
@@ -577,11 +577,12 @@ where
         &self,
         request: HeadersRequest,
         priority: Priority,
-    ) -> HeadersRequestFuture<H::Output> {
+    ) -> HeadersRequestFuture<H::Output, H::Header> {
         let client = Arc::clone(&self.client);
         HeadersRequestFuture {
             request: Some(request.clone()),
             fut: client.get_headers_with_priority(request, priority),
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -878,16 +879,17 @@ where
 
 /// A future that returns a list of [`Header`] on success.
 #[derive(Debug)]
-struct HeadersRequestFuture<F> {
+struct HeadersRequestFuture<F, H> {
     request: Option<HeadersRequest>,
     fut: F,
+    _phantom: std::marker::PhantomData<H>,
 }
 
-impl<F> Future for HeadersRequestFuture<F>
+impl<F, H> Future for HeadersRequestFuture<F, H>
 where
-    F: Future<Output = PeerRequestResult<Vec<Header>>> + Sync + Send + Unpin,
+    F: Future<Output = PeerRequestResult<Vec<H>>> + Sync + Send + Unpin,
 {
-    type Output = HeadersRequestOutcome;
+    type Output = HeadersRequestOutcome<H>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -899,14 +901,14 @@ where
 }
 
 /// The outcome of the [`HeadersRequestFuture`]
-struct HeadersRequestOutcome {
+struct HeadersRequestOutcome<H> {
     request: HeadersRequest,
-    outcome: PeerRequestResult<Vec<Header>>,
+    outcome: PeerRequestResult<Vec<H>>,
 }
 
 // === impl OrderedHeadersResponse ===
 
-impl HeadersRequestOutcome {
+impl<H> HeadersRequestOutcome<H> {
     fn block_number(&self) -> u64 {
         self.request.start.as_number().expect("is number")
     }

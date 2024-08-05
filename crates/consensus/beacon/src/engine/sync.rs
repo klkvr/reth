@@ -7,6 +7,7 @@ use crate::{
 use futures::FutureExt;
 use reth_chainspec::ChainSpec;
 use reth_db_api::database::Database;
+use reth_eth_wire_types::NetworkTypes;
 use reth_network_p2p::{
     full_block::{FetchFullBlockFuture, FetchFullBlockRangeFuture, FullBlockClient},
     BlockClient,
@@ -31,13 +32,14 @@ use tracing::trace;
 /// Caution: If the pipeline is running, this type will not emit blocks downloaded from the network
 /// [`EngineSyncEvent::FetchedFullBlock`] until the pipeline is idle to prevent commits to the
 /// database while the pipeline is still active.
-pub(crate) struct EngineSyncController<DB, Client>
+pub(crate) struct EngineSyncController<DB, Client, NetworkT>
 where
     DB: Database,
-    Client: BlockClient,
+    Client: BlockClient<NetworkT>,
+    NetworkT: NetworkTypes,
 {
     /// A downloader that can download full blocks from the network.
-    full_block_client: FullBlockClient<Client>,
+    full_block_client: FullBlockClient<Client, NetworkT>,
     /// The type that can spawn the pipeline task.
     pipeline_task_spawner: Box<dyn TaskSpawner>,
     /// The current state of the pipeline.
@@ -46,9 +48,9 @@ where
     /// Pending target block for the pipeline to sync
     pending_pipeline_target: Option<PipelineTarget>,
     /// In-flight full block requests in progress.
-    inflight_full_block_requests: Vec<FetchFullBlockFuture<Client>>,
+    inflight_full_block_requests: Vec<FetchFullBlockFuture<Client, NetworkT>>,
     /// In-flight full block _range_ requests in progress.
-    inflight_block_range_requests: Vec<FetchFullBlockRangeFuture<Client>>,
+    inflight_block_range_requests: Vec<FetchFullBlockRangeFuture<Client, NetworkT>>,
     /// Sender for engine events.
     event_sender: EventSender<BeaconConsensusEngineEvent>,
     /// Buffered blocks from downloads - this is a min-heap of blocks, using the block number for
@@ -61,10 +63,11 @@ where
     metrics: EngineSyncMetrics,
 }
 
-impl<DB, Client> EngineSyncController<DB, Client>
+impl<DB, Client, NetworkT> EngineSyncController<DB, Client, NetworkT>
 where
     DB: Database + 'static,
-    Client: BlockClient + 'static,
+    Client: BlockClient<NetworkT> + 'static,
+    NetworkT: NetworkTypes,
 {
     /// Create a new instance
     pub(crate) fn new(

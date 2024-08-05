@@ -540,3 +540,8 @@ serial_test = "3"
 similar-asserts = "1.5.0"
 tempfile = "3.8"
 test-fuzz = "5"
+
+[patch.crates-io]
+alloy-primitives = { path = "../core/crates/primitives" }
+alloy-dyn-abi = { path = "../core/crates/dyn-abi" }
+alloy-sol-types = { path = "../core/crates/sol-types" }

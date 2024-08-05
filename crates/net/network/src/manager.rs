@@ -30,7 +30,7 @@ use std::{
 use futures::{Future, StreamExt};
 use parking_lot::Mutex;
 use reth_eth_wire::{
-    capability::CapabilityMessage, Capabilities, DisconnectReason, EthVersion, Status,
+    capability::CapabilityMessage, Capabilities, DisconnectReason, EthVersion, NetworkTypes, Status,
 };
 use reth_fs_util::{self as fs, FsPathError};
 use reth_metrics::common::mpsc::UnboundedMeteredSender;
@@ -77,20 +77,20 @@ use crate::{
 /// include_mmd!("docs/mermaid/network-manager.mmd")
 #[derive(Debug)]
 #[must_use = "The NetworkManager does nothing unless polled"]
-pub struct NetworkManager {
+pub struct NetworkManager<T: NetworkTypes> {
     /// The type that manages the actual network part, which includes connections.
-    swarm: Swarm,
+    swarm: Swarm<T>,
     /// Underlying network handle that can be shared.
-    handle: NetworkHandle,
+    handle: NetworkHandle<T>,
     /// Receiver half of the command channel set up between this type and the [`NetworkHandle`]
-    from_handle_rx: UnboundedReceiverStream<NetworkHandleMessage>,
+    from_handle_rx: UnboundedReceiverStream<NetworkHandleMessage<T>>,
     /// Handles block imports according to the `eth` protocol.
-    block_import: Box<dyn BlockImport>,
+    block_import: Box<dyn BlockImport<T::Block>>,
     /// Sender for high level network events.
-    event_sender: EventSender<NetworkEvent>,
+    event_sender: EventSender<NetworkEvent<T>>,
     /// Sender half to send events to the
     /// [`TransactionsManager`](crate::transactions::TransactionsManager) task, if configured.
-    to_transactions_manager: Option<UnboundedMeteredSender<NetworkTransactionEvent>>,
+    to_transactions_manager: Option<UnboundedMeteredSender<NetworkTransactionEvent<T>>>,
     /// Sender half to send events to the
     /// [`EthRequestHandler`](crate::eth_requests::EthRequestHandler) task, if configured.
     ///
@@ -104,7 +104,7 @@ pub struct NetworkManager {
     /// Thus, we use a bounded channel here to avoid unbounded build up if the node is flooded with
     /// requests. This channel size is set at
     /// [`ETH_REQUEST_CHANNEL_CAPACITY`](crate::builder::ETH_REQUEST_CHANNEL_CAPACITY)
-    to_eth_request_handler: Option<mpsc::Sender<IncomingEthRequest>>,
+    to_eth_request_handler: Option<mpsc::Sender<IncomingEthRequest<T>>>,
     /// Tracks the number of active session (connected peers).
     ///
     /// This is updated via internal events and shared via `Arc` with the [`NetworkHandle`]
@@ -117,17 +117,17 @@ pub struct NetworkManager {
 }
 
 // === impl NetworkManager ===
-impl NetworkManager {
+impl<T: NetworkTypes> NetworkManager<T> {
     /// Sets the dedicated channel for events indented for the
     /// [`TransactionsManager`](crate::transactions::TransactionsManager).
-    pub fn set_transactions(&mut self, tx: mpsc::UnboundedSender<NetworkTransactionEvent>) {
+    pub fn set_transactions(&mut self, tx: mpsc::UnboundedSender<NetworkTransactionEvent<T>>) {
         self.to_transactions_manager =
             Some(UnboundedMeteredSender::new(tx, NETWORK_POOL_TRANSACTIONS_SCOPE));
     }
 
     /// Sets the dedicated channel for events indented for the
     /// [`EthRequestHandler`](crate::eth_requests::EthRequestHandler).
-    pub fn set_eth_request_handler(&mut self, tx: mpsc::Sender<IncomingEthRequest>) {
+    pub fn set_eth_request_handler(&mut self, tx: mpsc::Sender<IncomingEthRequest<T>>) {
         self.to_eth_request_handler = Some(tx);
     }
 
@@ -139,7 +139,7 @@ impl NetworkManager {
     /// Returns the [`NetworkHandle`] that can be cloned and shared.
     ///
     /// The [`NetworkHandle`] can be used to interact with this [`NetworkManager`]
-    pub const fn handle(&self) -> &NetworkHandle {
+    pub const fn handle(&self) -> &NetworkHandle<T> {
         &self.handle
     }
 
@@ -162,13 +162,13 @@ impl NetworkManager {
     }
 }
 
-impl NetworkManager {
+impl<T: NetworkTypes> NetworkManager<T> {
     /// Creates the manager of a new network.
     ///
     /// The [`NetworkManager`] is an endless future that needs to be polled in order to advance the
     /// state of the entire network.
     pub async fn new<C: BlockNumReader + 'static>(
-        config: NetworkConfig<C>,
+        config: NetworkConfig<C, T>,
     ) -> Result<Self, NetworkError> {
         let NetworkConfig {
             client,
@@ -254,7 +254,7 @@ impl NetworkManager {
 
         let (to_manager_tx, from_handle_rx) = mpsc::unbounded_channel();
 
-        let event_sender: EventSender<NetworkEvent> = Default::default();
+        let event_sender: EventSender<NetworkEvent<T>> = Default::default();
 
         let handle = NetworkHandle::new(
             Arc::clone(&num_active_peers),
@@ -313,14 +313,14 @@ impl NetworkManager {
     /// }
     /// ```
     pub async fn builder<C: BlockNumReader + 'static>(
-        config: NetworkConfig<C>,
-    ) -> Result<NetworkBuilder<(), ()>, NetworkError> {
+        config: NetworkConfig<C, T>,
+    ) -> Result<NetworkBuilder<(), (), T>, NetworkError> {
         let network = Self::new(config).await?;
         Ok(network.into_builder())
     }
 
     /// Create a [`NetworkBuilder`] to configure all components of the network
-    pub const fn into_builder(self) -> NetworkBuilder<(), ()> {
+    pub const fn into_builder(self) -> NetworkBuilder<(), (), T> {
         NetworkBuilder { network: self, transactions: (), request_handler: () }
     }
 
@@ -368,7 +368,7 @@ impl NetworkManager {
     /// Returns a new [`FetchClient`] that can be cloned and shared.
     ///
     /// The [`FetchClient`] is the entrypoint for sending requests to the network.
-    pub fn fetch_client(&self) -> FetchClient {
+    pub fn fetch_client(&self) -> FetchClient<T> {
         self.swarm.state().fetch_client()
     }
 
@@ -396,7 +396,7 @@ impl NetworkManager {
         &mut self,
         peer_id: PeerId,
         _capabilities: Arc<Capabilities>,
-        _message: CapabilityMessage,
+        _message: CapabilityMessage<T>,
     ) {
         trace!(target: "net", ?peer_id, "received unexpected message");
         self.swarm
@@ -407,7 +407,7 @@ impl NetworkManager {
 
     /// Sends an event to the [`TransactionsManager`](crate::transactions::TransactionsManager) if
     /// configured.
-    fn notify_tx_manager(&self, event: NetworkTransactionEvent) {
+    fn notify_tx_manager(&self, event: NetworkTransactionEvent<T>) {
         if let Some(ref tx) = self.to_transactions_manager {
             let _ = tx.send(event);
         }
@@ -415,7 +415,7 @@ impl NetworkManager {
 
     /// Sends an event to the [`EthRequestManager`](crate::eth_requests::EthRequestHandler) if
     /// configured.
-    fn delegate_eth_request(&self, event: IncomingEthRequest) {
+    fn delegate_eth_request(&self, event: IncomingEthRequest<T>) {
         if let Some(ref reqs) = self.to_eth_request_handler {
             let _ = reqs.try_send(event).map_err(|e| {
                 if let TrySendError::Full(_) = e {
@@ -427,7 +427,7 @@ impl NetworkManager {
     }
 
     /// Handle an incoming request from the peer
-    fn on_eth_request(&self, peer_id: PeerId, req: PeerRequest) {
+    fn on_eth_request(&self, peer_id: PeerId, req: PeerRequest<T>) {
         match req {
             PeerRequest::GetBlockHeaders { request, response } => {
                 self.delegate_eth_request(IncomingEthRequest::GetBlockHeaders {
@@ -468,7 +468,7 @@ impl NetworkManager {
     }
 
     /// Invoked after a `NewBlock` message from the peer was validated
-    fn on_block_import_result(&mut self, outcome: BlockImportOutcome) {
+    fn on_block_import_result(&mut self, outcome: BlockImportOutcome<T::Block>) {
         let BlockImportOutcome { peer, result } = outcome;
         match result {
             Ok(validated_block) => match validated_block {
@@ -510,7 +510,7 @@ impl NetworkManager {
     }
 
     /// Handles a received Message from the peer's session.
-    fn on_peer_message(&mut self, peer_id: PeerId, msg: PeerMessage) {
+    fn on_peer_message(&mut self, peer_id: PeerId, msg: PeerMessage<T>) {
         match msg {
             PeerMessage::NewBlockHashes(hashes) => {
                 self.within_pow_or_disconnect(peer_id, |this| {
@@ -550,7 +550,7 @@ impl NetworkManager {
     }
 
     /// Handler for received messages from a handle
-    fn on_handle_message(&mut self, msg: NetworkHandleMessage) {
+    fn on_handle_message(&mut self, msg: NetworkHandleMessage<T>) {
         match msg {
             NetworkHandleMessage::DiscoveryListener(tx) => {
                 self.swarm.state_mut().discovery_mut().add_listener(tx);
@@ -649,7 +649,7 @@ impl NetworkManager {
         }
     }
 
-    fn on_swarm_event(&mut self, event: SwarmEvent) {
+    fn on_swarm_event(&mut self, event: SwarmEvent<T>) {
         // handle event
         match event {
             SwarmEvent::ValidMessage { peer_id, message } => self.on_peer_message(peer_id, message),
@@ -946,7 +946,7 @@ impl NetworkManager {
     }
 }
 
-impl NetworkManager {
+impl<T: NetworkTypes> NetworkManager<T> {
     /// Drives the [`NetworkManager`] future until a [`GracefulShutdown`] signal is received.
     ///
     /// This invokes the given function `shutdown_hook` while holding the graceful shutdown guard.
@@ -972,7 +972,7 @@ impl NetworkManager {
     }
 }
 
-impl Future for NetworkManager {
+impl<T: NetworkTypes> Future for NetworkManager<T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1049,7 +1049,7 @@ impl Future for NetworkManager {
 /// This includes any event types that may be relevant to tasks, for metrics, keep track of peers
 /// etc.
 #[derive(Debug, Clone)]
-pub enum NetworkEvent {
+pub enum NetworkEvent<T: NetworkTypes> {
     /// Closed the peer session.
     SessionClosed {
         /// The identifier of the peer to which a session was closed.
@@ -1068,7 +1068,7 @@ pub enum NetworkEvent {
         /// Capabilities the peer announced
         capabilities: Arc<Capabilities>,
         /// A request channel to the session task.
-        messages: PeerRequestSender,
+        messages: PeerRequestSender<T>,
         /// The status of the peer to which a session was established.
         status: Arc<Status>,
         /// negotiated eth version of the session

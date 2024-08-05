@@ -7,6 +7,7 @@ use reth_blockchain_tree_api::{
 use reth_db_api::database::Database;
 use reth_engine_primitives::EngineTypes;
 use reth_errors::{BlockValidationError, ProviderResult, RethError, RethResult};
+use reth_eth_wire_types::NetworkTypes;
 use reth_network_p2p::{
     sync::{NetworkSyncUpdater, SyncState},
     BlockClient,
@@ -167,19 +168,20 @@ type PendingForkchoiceUpdate<PayloadAttributes> =
 /// If the future is polled more than once. Leads to undefined state.
 #[must_use = "Future does nothing unless polled"]
 #[allow(missing_debug_implementations)]
-pub struct BeaconConsensusEngine<DB, BT, Client, EngineT>
+pub struct BeaconConsensusEngine<DB, BT, Client, EngineT, NetworkT>
 where
     DB: Database,
-    Client: BlockClient,
+    Client: BlockClient<NetworkT>,
     BT: BlockchainTreeEngine
         + BlockReader
         + BlockIdReader
         + CanonChainTracker
         + StageCheckpointReader,
     EngineT: EngineTypes,
+    NetworkT: NetworkTypes,
 {
     /// Controls syncing triggered by engine updates.
-    sync: EngineSyncController<DB, Client>,
+    sync: EngineSyncController<DB, Client, NetworkT>,
     /// The type we can use to query both the database and the blockchain tree.
     blockchain: BT,
     /// Used for emitting updates about whether the engine is syncing or not.
@@ -223,7 +225,7 @@ where
     metrics: EngineMetrics,
 }
 
-impl<DB, BT, Client, EngineT> BeaconConsensusEngine<DB, BT, Client, EngineT>
+impl<DB, BT, Client, EngineT, NetworkT> BeaconConsensusEngine<DB, BT, Client, EngineT, NetworkT>
 where
     DB: Database + Unpin + 'static,
     BT: BlockchainTreeEngine
@@ -233,8 +235,9 @@ where
         + StageCheckpointReader
         + ChainSpecProvider
         + 'static,
-    Client: BlockClient + 'static,
+    Client: BlockClient<NetworkT> + 'static,
     EngineT: EngineTypes + Unpin,
+    NetworkT: NetworkTypes,
 {
     /// Create a new instance of the [`BeaconConsensusEngine`].
     #[allow(clippy::too_many_arguments)]
@@ -1788,10 +1791,11 @@ where
 /// local forkchoice state, it will launch the pipeline to sync to the head hash.
 /// While the pipeline is syncing, the consensus engine will keep processing messages from the
 /// receiver and forwarding them to the blockchain tree.
-impl<DB, BT, Client, EngineT> Future for BeaconConsensusEngine<DB, BT, Client, EngineT>
+impl<DB, BT, Client, EngineT, NetworkT> Future
+    for BeaconConsensusEngine<DB, BT, Client, EngineT, NetworkT>
 where
     DB: Database + Unpin + 'static,
-    Client: BlockClient + 'static,
+    Client: BlockClient<NetworkT> + 'static,
     BT: BlockchainTreeEngine
         + BlockReader
         + BlockIdReader
@@ -1801,6 +1805,7 @@ where
         + Unpin
         + 'static,
     EngineT: EngineTypes + Unpin,
+    NetworkT: NetworkTypes,
 {
     type Output = Result<(), BeaconConsensusEngineError>;
 

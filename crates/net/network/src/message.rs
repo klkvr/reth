@@ -11,10 +11,10 @@ use std::{
 
 use futures::FutureExt;
 use reth_eth_wire::{
-    capability::RawCapabilityMessage, message::RequestPair, BlockBodies, BlockHeaders, EthMessage,
-    GetBlockBodies, GetBlockHeaders, GetNodeData, GetPooledTransactions, GetReceipts, NewBlock,
-    NewBlockHashes, NewPooledTransactionHashes, NodeData, PooledTransactions, Receipts,
-    SharedTransactions, Transactions,
+    capability::RawCapabilityMessage, message::RequestPair, Block, BlockBodies, BlockHeader,
+    BlockHeaders, EthMessage, GetBlockBodies, GetBlockHeaders, GetNodeData, GetPooledTransactions,
+    GetReceipts, NetworkTypes, NewBlock, NewBlockHashes, NewPooledTransactionHashes, NodeData,
+    PooledTransactions, Receipts, SharedTransactions, Transactions,
 };
 use reth_network_p2p::error::{RequestError, RequestResult};
 use reth_network_peers::PeerId;
@@ -25,30 +25,30 @@ use tokio::sync::{mpsc, mpsc::error::TrySendError, oneshot};
 
 /// Internal form of a `NewBlock` message
 #[derive(Debug, Clone)]
-pub struct NewBlockMessage {
+pub struct NewBlockMessage<B> {
     /// Hash of the block
     pub hash: B256,
     /// Raw received message
-    pub block: Arc<NewBlock>,
+    pub block: Arc<NewBlock<B>>,
 }
 
 // === impl NewBlockMessage ===
 
-impl NewBlockMessage {
+impl<B: Block> NewBlockMessage<B> {
     /// Returns the block number of the block
     pub fn number(&self) -> u64 {
-        self.block.block.header.number
+        self.block.block.header().number()
     }
 }
 
 /// All Bi-directional eth-message variants that can be sent to a session or received from a
 /// session.
 #[derive(Debug)]
-pub enum PeerMessage {
+pub enum PeerMessage<T: NetworkTypes> {
     /// Announce new block hashes
     NewBlockHashes(NewBlockHashes),
     /// Broadcast new block.
-    NewBlock(NewBlockMessage),
+    NewBlock(NewBlockMessage<T::Block>),
     /// Received transactions _from_ the peer
     ReceivedTransaction(Transactions),
     /// Broadcast transactions _from_ local _to_ a peer.
@@ -56,7 +56,7 @@ pub enum PeerMessage {
     /// Send new pooled transactions
     PooledTransactions(NewPooledTransactionHashes),
     /// All `eth` request variants.
-    EthRequest(PeerRequest),
+    EthRequest(PeerRequest<T>),
     /// Other than eth namespace message
     Other(RawCapabilityMessage),
 }
@@ -77,7 +77,7 @@ pub enum BlockRequest {
 
 /// Protocol related request messages that expect a response
 #[derive(Debug)]
-pub enum PeerRequest {
+pub enum PeerRequest<T: NetworkTypes> {
     /// Requests block headers from the peer.
     ///
     /// The response should be sent through the channel.
@@ -85,7 +85,7 @@ pub enum PeerRequest {
         /// The request for block headers.
         request: GetBlockHeaders,
         /// The channel to send the response for block headers.
-        response: oneshot::Sender<RequestResult<BlockHeaders>>,
+        response: oneshot::Sender<RequestResult<BlockHeaders<T::BlockHeader>>>,
     },
     /// Requests block bodies from the peer.
     ///
@@ -94,7 +94,7 @@ pub enum PeerRequest {
         /// The request for block bodies.
         request: GetBlockBodies,
         /// The channel to send the response for block bodies.
-        response: oneshot::Sender<RequestResult<BlockBodies>>,
+        response: oneshot::Sender<RequestResult<BlockBodies<T::BlockBody>>>,
     },
     /// Requests pooled transactions from the peer.
     ///
@@ -127,7 +127,7 @@ pub enum PeerRequest {
 
 // === impl PeerRequest ===
 
-impl PeerRequest {
+impl<T: NetworkTypes> PeerRequest<T> {
     /// Invoked if we received a response which does not match the request
     pub(crate) fn send_bad_response(self) {
         self.send_err_response(RequestError::BadResponse)
@@ -145,7 +145,7 @@ impl PeerRequest {
     }
 
     /// Returns the [`EthMessage`] for this type
-    pub fn create_request_message(&self, request_id: u64) -> EthMessage {
+    pub fn create_request_message(&self, request_id: u64) -> EthMessage<T> {
         match self {
             Self::GetBlockHeaders { request, .. } => {
                 EthMessage::GetBlockHeaders(RequestPair { request_id, message: *request })
@@ -179,16 +179,16 @@ impl PeerRequest {
 
 /// Corresponding variant for [`PeerRequest`].
 #[derive(Debug)]
-pub enum PeerResponse {
+pub enum PeerResponse<T: NetworkTypes> {
     /// Represents a response to a request for block headers.
     BlockHeaders {
         /// The receiver channel for the response to a block headers request.
-        response: oneshot::Receiver<RequestResult<BlockHeaders>>,
+        response: oneshot::Receiver<RequestResult<BlockHeaders<T::BlockHeader>>>,
     },
     /// Represents a response to a request for block bodies.
     BlockBodies {
         /// The receiver channel for the response to a block bodies request.
-        response: oneshot::Receiver<RequestResult<BlockBodies>>,
+        response: oneshot::Receiver<RequestResult<BlockBodies<T::BlockBody>>>,
     },
     /// Represents a response to a request for pooled transactions.
     PooledTransactions {
@@ -209,9 +209,9 @@ pub enum PeerResponse {
 
 // === impl PeerResponse ===
 
-impl PeerResponse {
+impl<T: NetworkTypes> PeerResponse<T> {
     /// Polls the type to completion.
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<PeerResponseResult> {
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<PeerResponseResult<T>> {
         macro_rules! poll_request {
             ($response:ident, $item:ident, $cx:ident) => {
                 match ready!($response.poll_unpin($cx)) {
@@ -244,11 +244,11 @@ impl PeerResponse {
 
 /// All response variants for [`PeerResponse`]
 #[derive(Debug)]
-pub enum PeerResponseResult {
+pub enum PeerResponseResult<T: NetworkTypes> {
     /// Represents a result containing block headers or an error.
-    BlockHeaders(RequestResult<Vec<Header>>),
+    BlockHeaders(RequestResult<Vec<T::BlockHeader>>),
     /// Represents a result containing block bodies or an error.
-    BlockBodies(RequestResult<Vec<BlockBody>>),
+    BlockBodies(RequestResult<Vec<T::BlockBody>>),
     /// Represents a result containing pooled transactions or an error.
     PooledTransactions(RequestResult<Vec<PooledTransactionsElement>>),
     /// Represents a result containing node data or an error.
@@ -259,9 +259,9 @@ pub enum PeerResponseResult {
 
 // === impl PeerResponseResult ===
 
-impl PeerResponseResult {
+impl<T: NetworkTypes> PeerResponseResult<T> {
     /// Converts this response into an [`EthMessage`]
-    pub fn try_into_message(self, id: u64) -> RequestResult<EthMessage> {
+    pub fn try_into_message(self, id: u64) -> RequestResult<EthMessage<T>> {
         macro_rules! to_message {
             ($response:ident, $item:ident, $request_id:ident) => {
                 match $response {
@@ -311,23 +311,23 @@ impl PeerResponseResult {
 
 /// A Cloneable connection for sending _requests_ directly to the session of a peer.
 #[derive(Clone)]
-pub struct PeerRequestSender {
+pub struct PeerRequestSender<T: NetworkTypes> {
     /// id of the remote node.
     pub(crate) peer_id: PeerId,
     /// The Sender half connected to a session.
-    pub(crate) to_session_tx: mpsc::Sender<PeerRequest>,
+    pub(crate) to_session_tx: mpsc::Sender<PeerRequest<T>>,
 }
 
 // === impl PeerRequestSender ===
 
-impl PeerRequestSender {
+impl<T: NetworkTypes> PeerRequestSender<T> {
     /// Constructs a new sender instance that's wired to a session
-    pub(crate) const fn new(peer_id: PeerId, to_session_tx: mpsc::Sender<PeerRequest>) -> Self {
+    pub(crate) const fn new(peer_id: PeerId, to_session_tx: mpsc::Sender<PeerRequest<T>>) -> Self {
         Self { peer_id, to_session_tx }
     }
 
     /// Attempts to immediately send a message on this Sender
-    pub fn try_send(&self, req: PeerRequest) -> Result<(), TrySendError<PeerRequest>> {
+    pub fn try_send(&self, req: PeerRequest<T>) -> Result<(), TrySendError<PeerRequest<T>>> {
         self.to_session_tx.try_send(req)
     }
 
@@ -337,7 +337,7 @@ impl PeerRequestSender {
     }
 }
 
-impl fmt::Debug for PeerRequestSender {
+impl<T: NetworkTypes> fmt::Debug for PeerRequestSender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PeerRequestSender").field("peer_id", &self.peer_id).finish_non_exhaustive()
     }
