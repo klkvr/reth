@@ -890,6 +890,10 @@ pub trait Call: LoadState + SpawnBlocking {
                     // Increase the lowest gas limit if gas is too high
                     lowest_gas_limit = mid_gas_limit;
                 }
+                Err(err) if err.is_gas_too_low() => {
+                    // Decrease the highest gas limit if gas is too low
+                    highest_gas_limit = mid_gas_limit;
+                }
                 // Handle other cases, including successful transactions.
                 ethres => {
                     trace!(target: "rpc::eth::estimate", ?ethres, ?mid_gas_limit, "Got result");
