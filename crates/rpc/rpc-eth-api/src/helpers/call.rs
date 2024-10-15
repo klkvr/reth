@@ -803,6 +803,8 @@ pub trait Call: LoadState + SpawnBlocking {
             ethres => ethres?,
         };
 
+        trace!(target: "rpc::eth::estimate", ?res, "Execution result");
+
         let gas_refund = match res.result {
             ExecutionResult::Success { gas_refunded, .. } => gas_refunded,
             ExecutionResult::Halt { reason, gas_used } => {
