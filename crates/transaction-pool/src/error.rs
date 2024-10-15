@@ -250,8 +250,6 @@ impl InvalidPoolTransactionError {
                         // transaction could just have arrived late/early
                         false
                     }
-                    InvalidTransactionError::GasTooLow |
-                    InvalidTransactionError::GasTooHigh |
                     InvalidTransactionError::TipAboveFeeCap => {
                         // these are technically not invalid
                         false

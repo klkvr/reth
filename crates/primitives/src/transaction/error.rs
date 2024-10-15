@@ -44,12 +44,6 @@ pub enum InvalidTransactionError {
     /// The calculated gas of the transaction exceeds `u64::MAX`.
     #[display("gas overflow (maximum of u64)")]
     GasUintOverflow,
-    /// The transaction is specified to use less gas than required to start the invocation.
-    #[display("intrinsic gas too low")]
-    GasTooLow,
-    /// The transaction gas exceeds the limit
-    #[display("intrinsic gas too high")]
-    GasTooHigh,
     /// Thrown to ensure no one is able to specify a transaction with a tip higher than the total
     /// fee cap.
     #[display("max priority fee per gas higher than max fee per gas")]

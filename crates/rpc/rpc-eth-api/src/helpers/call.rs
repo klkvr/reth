@@ -887,12 +887,12 @@ pub trait Call: LoadState + SpawnBlocking {
             // Execute transaction and handle potential gas errors, adjusting limits accordingly.
             match self.transact(&mut db, env.clone()) {
                 Err(err) if err.is_gas_too_high() => {
-                    // Increase the lowest gas limit if gas is too high
-                    lowest_gas_limit = mid_gas_limit;
+                    // Decrease the highes gas limit if gas is too high
+                    highest_gas_limit = mid_gas_limit;
                 }
                 Err(err) if err.is_gas_too_low() => {
-                    // Decrease the highest gas limit if gas is too low
-                    highest_gas_limit = mid_gas_limit;
+                    // Increase the lowerst gas limit if gas is too low
+                    lowest_gas_limit = mid_gas_limit;
                 }
                 // Handle other cases, including successful transactions.
                 ethres => {
