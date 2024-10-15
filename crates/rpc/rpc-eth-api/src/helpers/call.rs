@@ -842,6 +842,7 @@ pub trait Call: LoadState + SpawnBlocking {
         // Calculate the optimistic gas limit by adding gas used and gas refund,
         // then applying a 64/63 multiplier to account for gas forwarding rules.
         let optimistic_gas_limit = (gas_used + gas_refund + CALL_STIPEND_GAS) * 64 / 63;
+        trace!(target: "rpc::eth::estimate", ?env, ?highest_gas_limit, ?lowest_gas_limit, ?optimistic_gas_limit, "Trying optimistic gas limit");
         if optimistic_gas_limit < highest_gas_limit {
             // Set the transaction's gas limit to the calculated optimistic gas limit.
             env.tx.gas_limit = optimistic_gas_limit;
