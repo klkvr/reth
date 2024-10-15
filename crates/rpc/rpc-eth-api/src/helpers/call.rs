@@ -892,6 +892,7 @@ pub trait Call: LoadState + SpawnBlocking {
                 }
                 // Handle other cases, including successful transactions.
                 ethres => {
+                    trace!(target: "rpc::eth::estimate", ?ethres, ?mid_gas_limit, "Got result");
                     // Unpack the result and environment if the transaction was successful.
                     (res, env) = ethres?;
                     // Update the estimated gas range based on the transaction result.
