@@ -58,4 +58,5 @@ std = [
     "serde_json/std",
     "reth-primitives-traits/std",
     "reth-chainspec/std",
+    "alloy-evm/std",
 ]
