@@ -33,17 +33,130 @@ use reth_rpc_eth_types::{
     EthApiError, RevertError, RpcInvalidTransactionError, StateCacheDb,
 };
 use revm::{
+    context::ContextTr,
     context_interface::{
         result::{ExecutionResult, ResultAndState},
         Transaction,
     },
+    interpreter::interpreter::EthInterpreter,
     Database, DatabaseCommit,
 };
-use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
+use revm_inspector::JournalExt;
+use revm_inspectors::{
+    access_list::AccessListInspector,
+    tracing::{TracingInspector, TracingInspectorConfig},
+    transfer::TransferInspector,
+};
 use tracing::trace;
 
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
+
+struct Insp {
+    access_list: AccessListInspector,
+    trace: TracingInspector,
+}
+
+impl<CTX: ContextTr<Journal: JournalExt>> revm::Inspector<CTX> for Insp {
+    fn call(
+        &mut self,
+        context: &mut CTX,
+        inputs: &mut revm::interpreter::CallInputs,
+    ) -> Option<revm::interpreter::CallOutcome> {
+        self.access_list.call(context, inputs);
+        self.trace.call(context, inputs)
+    }
+
+    fn call_end(
+        &mut self,
+        context: &mut CTX,
+        inputs: &revm::interpreter::CallInputs,
+        outcome: &mut revm::interpreter::CallOutcome,
+    ) {
+        self.access_list.call_end(context, inputs, outcome);
+        self.trace.call_end(context, inputs, outcome)
+    }
+
+    fn create(
+        &mut self,
+        context: &mut CTX,
+        inputs: &mut revm::interpreter::CreateInputs,
+    ) -> Option<revm::interpreter::CreateOutcome> {
+        self.access_list.create(context, inputs);
+        self.trace.create(context, inputs)
+    }
+
+    fn create_end(
+        &mut self,
+        context: &mut CTX,
+        inputs: &revm::interpreter::CreateInputs,
+        outcome: &mut revm::interpreter::CreateOutcome,
+    ) {
+        self.access_list.create_end(context, inputs, outcome);
+        self.trace.create_end(context, inputs, outcome)
+    }
+
+    fn eofcreate(
+        &mut self,
+        context: &mut CTX,
+        inputs: &mut revm::interpreter::EOFCreateInputs,
+    ) -> Option<revm::interpreter::CreateOutcome> {
+        self.access_list.eofcreate(context, inputs);
+        self.trace.eofcreate(context, inputs)
+    }
+
+    fn eofcreate_end(
+        &mut self,
+        context: &mut CTX,
+        inputs: &revm::interpreter::EOFCreateInputs,
+        outcome: &mut revm::interpreter::CreateOutcome,
+    ) {
+        self.access_list.eofcreate_end(context, inputs, outcome);
+        self.trace.eofcreate_end(context, inputs, outcome)
+    }
+
+    fn initialize_interp(
+        &mut self,
+        interp: &mut revm::interpreter::Interpreter<EthInterpreter>,
+        context: &mut CTX,
+    ) {
+        self.access_list.initialize_interp(interp, context);
+        self.trace.initialize_interp(interp, context)
+    }
+
+    fn log(
+        &mut self,
+        interp: &mut revm::interpreter::Interpreter<EthInterpreter>,
+        context: &mut CTX,
+        log: revm_primitives::Log,
+    ) {
+        self.access_list.log(interp, context, log.clone());
+        self.trace.log(interp, context, log)
+    }
+
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        revm::Inspector::<CTX>::selfdestruct(&mut self.access_list, contract, target, value);
+        revm::Inspector::<CTX>::selfdestruct(&mut self.trace, contract, target, value);
+    }
+
+    fn step(
+        &mut self,
+        interp: &mut revm::interpreter::Interpreter<EthInterpreter>,
+        context: &mut CTX,
+    ) {
+        self.access_list.step(interp, context);
+        self.trace.step(interp, context)
+    }
+
+    fn step_end(
+        &mut self,
+        interp: &mut revm::interpreter::Interpreter<EthInterpreter>,
+        context: &mut CTX,
+    ) {
+        self.access_list.step_end(interp, context);
+        self.trace.step_end(interp, context)
+    }
+}
 
 /// Execution related functions for the [`EthApiServer`](crate::EthApiServer) trait in
 /// the `eth_` namespace.
@@ -422,11 +535,20 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         // can consume the list since we're not using the request anymore
         let initial = request.access_list.take().unwrap_or_default();
 
-        let mut inspector = AccessListInspector::new(initial);
+        let mut inspector = Insp {
+            access_list: AccessListInspector::new(initial),
+            trace: TracingInspector::new(TracingInspectorConfig::all()),
+        };
 
         let (result, (evm_env, mut tx_env)) =
             self.inspect(&mut db, evm_env, tx_env, &mut inspector)?;
-        let access_list = inspector.into_access_list();
+        let traces = inspector.trace.clone().into_geth_builder().geth_traces(
+            1000000,
+            Default::default(),
+            Default::default(),
+        );
+        tracing::info!("{}", serde_json::to_string(&traces).unwrap());
+        let access_list = core::mem::take(&mut inspector.access_list).into_access_list();
         tx_env.set_access_list(access_list.clone());
         match result.result {
             ExecutionResult::Halt { reason, gas_used } => {
@@ -442,7 +564,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         };
 
         // transact again to get the exact gas used
-        let (result, (_, tx_env)) = self.transact(&mut db, evm_env, tx_env)?;
+        let (result, (_, tx_env)) = self.inspect(&mut db, evm_env, tx_env, &mut inspector)?;
         let res = match result.result {
             ExecutionResult::Halt { reason, gas_used } => {
                 let error =
@@ -457,6 +579,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 AccessListResult { access_list, gas_used: U256::from(gas_used), error: None }
             }
         };
+
+        let traces = inspector.trace.clone().into_geth_builder().geth_traces(
+            1000000,
+            Default::default(),
+            Default::default(),
+        );
+        tracing::info!("{}", serde_json::to_string(&traces).unwrap());
 
         Ok(res)
     }

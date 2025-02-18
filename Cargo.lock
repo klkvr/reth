@@ -9293,8 +9293,10 @@ dependencies = [
  "reth-transaction-pool",
  "reth-trie-common",
  "revm",
+ "revm-inspector",
  "revm-inspectors",
  "revm-primitives",
+ "serde_json",
  "tokio",
  "tracing",
 ]

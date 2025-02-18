@@ -42,7 +42,7 @@ pub trait Trace:
     /// Executes the [`EvmEnv`] against the given [Database] without committing state
     /// changes.
     #[expect(clippy::type_complexity)]
-    fn inspect<DB, I>(
+    fn inspect<'a, 'b, DB, I>(
         &self,
         db: DB,
         evm_env: EvmEnv<<Self::Evm as ConfigureEvmEnv>::Spec>,
@@ -56,8 +56,9 @@ pub trait Trace:
         Self::Error,
     >
     where
-        DB: Database<Error = ProviderError>,
-        I: InspectorFor<DB, Self::Evm>,
+        DB: Database<Error = ProviderError> + 'a,
+        I: InspectorFor<DB, Self::Evm> + 'b,
+        'a: 'b,
     {
         let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env.clone(), inspector);
         let res = evm.transact(tx_env.clone()).map_err(Self::Error::from_evm_err)?;

@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 # reth
 revm = { workspace = true, features = ["optional_block_gas_limit", "optional_eip3607", "optional_no_base_fee"] }
+revm-inspector = { workspace = true, features = ["serde-json"] }
 revm-inspectors.workspace = true
 revm-primitives = { workspace = true }
 reth-primitives-traits.workspace = true
@@ -55,6 +56,7 @@ parking_lot.workspace = true
 tokio.workspace = true
 
 # misc
+serde_json.workspace = true
 auto_impl.workspace = true
 dyn-clone.workspace = true
 tracing.workspace = true
