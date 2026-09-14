@@ -1535,7 +1535,7 @@ where
         // Bound gossip recovery CPU usage independently of the global Rayon pool.
         static RECOVERY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
             rayon::ThreadPoolBuilder::new()
-                .num_threads(8)
+                .num_threads(4)
                 .thread_name(|i| format!("gossip-recovery-{i:02}"))
                 .build()
                 .expect("failed to build gossip recovery pool")
