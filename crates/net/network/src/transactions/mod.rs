@@ -343,7 +343,7 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
     /// Once the new transaction reaches the __pending__ state it will be emitted by the pool via
     /// [`TransactionPool::pending_transactions_listener`] and arrive at the `pending_transactions`
     /// receiver.
-    pool_imports: FuturesUnordered<PoolImportFuture>,
+    pool_imports: FuturesUnordered<PendingPoolImportFuture>,
     /// Stats on pending pool imports that help the node self-monitor.
     pending_pool_imports_info: PendingPoolImportsInfo,
     /// Bad imports.
@@ -379,6 +379,16 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
     /// `AnnouncedTxTypes` metrics
     announced_tx_types_metrics: AnnouncedTxTypesMetrics,
 }
+
+/// Includes cleanup for hashes reserved while sender recovery was in flight.
+struct PendingPoolImportResult {
+    results: Vec<PoolResult<AddedTransactionOutcome>>,
+    failed_recovery_hashes: Vec<TxHash>,
+    bad_recovery_peer: Option<PeerId>,
+}
+
+type PendingPoolImportFuture =
+    Pin<Box<dyn Future<Output = PendingPoolImportResult> + Send + 'static>>;
 
 impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
     /// Sets up a new instance.
@@ -632,8 +642,14 @@ impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
 
 impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
     /// Processes a batch import results.
-    fn on_batch_import_result(&mut self, batch_results: Vec<PoolResult<AddedTransactionOutcome>>) {
-        for res in batch_results {
+    fn on_batch_import_result(&mut self, batch_results: PendingPoolImportResult) {
+        for hash in batch_results.failed_recovery_hashes {
+            self.transactions_by_peers.remove(&hash);
+        }
+        if let Some(peer_id) = batch_results.bad_recovery_peer {
+            self.report_peer_bad_transactions(peer_id);
+        }
+        for res in batch_results.results {
             match res {
                 Ok(AddedTransactionOutcome { hash, .. }) => {
                     self.on_good_import(hash);
@@ -1446,66 +1462,80 @@ where
                 .increment(already_known_txns_count as u64);
         }
 
-        let txs_len = transactions.len();
-
-        let recover = |tx| {
-            let recovered = if let Some(cache) = &self.sender_recovery_cache {
-                Pool::Transaction::try_recover_with_cache(tx, cache)
-            } else {
-                Pool::Transaction::try_recover(tx)
-            };
-            match recovered {
-                Ok(tx) => Some(tx),
-                Err(badtx) => {
-                    trace!(target: "net::tx",
-                        peer_id=format!("{peer_id:#}"),
-                        hash=%badtx.tx_hash(),
-                        client_version=%client_version,
-                        "failed ecrecovery for transaction"
-                    );
-                    None
-                }
+        if !transactions.is_empty() {
+            let txs_len = transactions.len();
+            let hashes = transactions.iter().map(|tx| *tx.tx_hash()).collect::<Vec<_>>();
+            // Reserve both deduplication state and import capacity before recovery is queued.
+            // Otherwise asynchronous recovery would bypass the existing import budget.
+            for hash in &hashes {
+                self.transactions_by_peers.insert(*hash, smallvec::smallvec![peer_id]);
             }
-        };
-
-        let new_txs = transactions.into_iter().filter_map(recover).collect::<Vec<_>>();
-
-        has_bad_transactions |= new_txs.len() != txs_len;
-
-        // Record the transactions as seen by the peer
-        for tx in &new_txs {
-            self.transactions_by_peers.insert(*tx.hash(), smallvec::smallvec![peer_id]);
-        }
-
-        // 3. import new transactions as a batch to minimize lock contention on the underlying
-        // pool
-        if !new_txs.is_empty() {
-            let pool = self.pool.clone();
-            // update metrics
             let metric_pending_pool_imports = self.metrics.pending_pool_imports.clone();
-            metric_pending_pool_imports.increment(new_txs.len() as f64);
+            metric_pending_pool_imports.increment(txs_len as f64);
+            let pending_pool_imports = self.pending_pool_imports_info.pending_pool_imports.clone();
+            pending_pool_imports.fetch_add(txs_len, Ordering::Relaxed);
 
-            // update self-monitoring info
-            self.pending_pool_imports_info
-                .pending_pool_imports
-                .fetch_add(new_txs.len(), Ordering::Relaxed);
-            let tx_manager_info_pending_pool_imports =
-                self.pending_pool_imports_info.pending_pool_imports.clone();
+            let pool = self.pool.clone();
+            let sender_recovery_cache = self.sender_recovery_cache.clone();
+            let recovery_client_version = client_version.clone();
+            let report_bad_recovery = !has_bad_transactions;
+            self.pool_imports.push(Box::pin(async move {
+                let recovered = tokio::task::spawn_blocking(move || {
+                    let mut new_txs = Vec::with_capacity(txs_len);
+                    let mut failed_hashes = Vec::new();
+                    for tx in transactions {
+                        let recovered = if let Some(cache) = &sender_recovery_cache {
+                            Pool::Transaction::try_recover_with_cache(tx, cache)
+                        } else {
+                            Pool::Transaction::try_recover(tx)
+                        };
+                        match recovered {
+                            Ok(tx) => new_txs.push(tx),
+                            Err(badtx) => {
+                                failed_hashes.push(*badtx.tx_hash());
+                                trace!(target: "net::tx",
+                                    peer_id=format!("{peer_id:#}"),
+                                    hash=%badtx.tx_hash(),
+                                    client_version=%recovery_client_version,
+                                    "failed ecrecovery for transaction"
+                                );
+                            }
+                        }
+                    }
+                    (new_txs, failed_hashes)
+                })
+                .await;
 
-            trace!(target: "net::tx::propagation", new_txs_len=?new_txs.len(), "Importing new transactions");
-            let import = Box::pin(async move {
-                let added = new_txs.len();
-                let res = pool.add_external_transactions(new_txs).await;
-
-                // update metrics
-                metric_pending_pool_imports.decrement(added as f64);
-                // update self-monitoring info
-                tx_manager_info_pending_pool_imports.fetch_sub(added, Ordering::Relaxed);
-
-                res
-            });
-
-            self.pool_imports.push(import);
+                let result = match recovered {
+                    Ok((new_txs, failed_recovery_hashes)) => {
+                        let bad_recovery_peer = (report_bad_recovery &&
+                            !failed_recovery_hashes.is_empty())
+                        .then_some(peer_id);
+                        let results = if new_txs.is_empty() {
+                            Vec::new()
+                        } else {
+                            pool.add_external_transactions(new_txs).await
+                        };
+                        PendingPoolImportResult {
+                            results,
+                            failed_recovery_hashes,
+                            bad_recovery_peer,
+                        }
+                    }
+                    Err(err) => {
+                        // A local task failure must release reservations without blaming the peer.
+                        debug!(target: "net::tx", ?peer_id, %err, "sender recovery task failed");
+                        PendingPoolImportResult {
+                            results: Vec::new(),
+                            failed_recovery_hashes: hashes,
+                            bad_recovery_peer: None,
+                        }
+                    }
+                };
+                metric_pending_pool_imports.decrement(txs_len as f64);
+                pending_pool_imports.fetch_sub(txs_len, Ordering::Relaxed);
+                result
+            }));
         }
 
         if num_already_seen_by_peer > 0 {
