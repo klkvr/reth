@@ -83,7 +83,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -1469,7 +1469,16 @@ where
             }
         };
 
-        let new_txs = transactions.into_par_iter().filter_map(recover).collect::<Vec<_>>();
+        // Bound gossip recovery CPU usage independently of the global Rayon pool.
+        static RECOVERY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .thread_name(|i| format!("gossip-recovery-{i:02}"))
+                .build()
+                .expect("failed to build gossip recovery pool")
+        });
+        let new_txs = RECOVERY_POOL
+            .install(|| transactions.into_par_iter().filter_map(recover).collect::<Vec<_>>());
 
         has_bad_transactions |= new_txs.len() != txs_len;
 
