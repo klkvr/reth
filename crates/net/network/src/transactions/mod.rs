@@ -82,7 +82,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -379,6 +379,15 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
     /// `AnnouncedTxTypes` metrics
     announced_tx_types_metrics: AnnouncedTxTypesMetrics,
 }
+
+/// Serialize recovery without holding a Tokio worker while batches are queued or running.
+static RECOVERY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .thread_name(|_| "gossip-recov-0".to_owned())
+        .build()
+        .expect("failed to create gossip recovery worker")
+});
 
 /// Includes cleanup for hashes reserved while sender recovery was in flight.
 struct PendingPoolImportResult {
@@ -1480,31 +1489,39 @@ where
             let recovery_client_version = client_version.clone();
             let report_bad_recovery = !has_bad_transactions;
             self.pool_imports.push(Box::pin(async move {
-                let recovered = tokio::task::spawn_blocking(move || {
-                    let mut new_txs = Vec::with_capacity(txs_len);
-                    let mut failed_hashes = Vec::new();
-                    for tx in transactions {
-                        let recovered = if let Some(cache) = &sender_recovery_cache {
-                            Pool::Transaction::try_recover_with_cache(tx, cache)
-                        } else {
-                            Pool::Transaction::try_recover(tx)
-                        };
-                        match recovered {
-                            Ok(tx) => new_txs.push(tx),
-                            Err(badtx) => {
-                                failed_hashes.push(*badtx.tx_hash());
-                                trace!(target: "net::tx",
-                                    peer_id=format!("{peer_id:#}"),
-                                    hash=%badtx.tx_hash(),
-                                    client_version=%recovery_client_version,
-                                    "failed ecrecovery for transaction"
-                                );
+                let (recovery_tx, recovery_rx) = oneshot::channel();
+                RECOVERY_POOL.spawn(move || {
+                    // Preserve task-failure cleanup if recovery panics: dropping the sender
+                    // wakes the import future, which releases the reserved hashes and capacity.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut new_txs = Vec::with_capacity(txs_len);
+                        let mut failed_hashes = Vec::new();
+                        for tx in transactions {
+                            let recovered = if let Some(cache) = &sender_recovery_cache {
+                                Pool::Transaction::try_recover_with_cache(tx, cache)
+                            } else {
+                                Pool::Transaction::try_recover(tx)
+                            };
+                            match recovered {
+                                Ok(tx) => new_txs.push(tx),
+                                Err(badtx) => {
+                                    failed_hashes.push(*badtx.tx_hash());
+                                    trace!(target: "net::tx",
+                                        peer_id=format!("{peer_id:#}"),
+                                        hash=%badtx.tx_hash(),
+                                        client_version=%recovery_client_version,
+                                        "failed ecrecovery for transaction"
+                                    );
+                                }
                             }
                         }
+                        (new_txs, failed_hashes)
+                    }));
+                    if let Ok(result) = result {
+                        let _ = recovery_tx.send(result);
                     }
-                    (new_txs, failed_hashes)
-                })
-                .await;
+                });
+                let recovered = recovery_rx.await;
 
                 let result = match recovered {
                     Ok((new_txs, failed_recovery_hashes)) => {
