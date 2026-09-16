@@ -303,7 +303,7 @@ fn resolve_transaction<T: evm2::EvmTypes>(
         TransactionResolution::Result(result) => Ok(result),
         TransactionResolution::DatabaseError(code) |
         TransactionResolution::HandlerError(HandlerError::Fatal(code)) => {
-            Err(BlockExecutionError::other(evm.database_mut().error(code)))
+            Err(BlockExecutionError::other(evm.error(code)))
         }
         TransactionResolution::HandlerError(err) => {
             Err(BlockValidationError::Other(Box::new(err)).into())

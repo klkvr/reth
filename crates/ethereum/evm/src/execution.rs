@@ -613,7 +613,7 @@ fn map_handler_error<T: EvmTypes>(evm: &mut Evm<'_, T>, err: HandlerError) -> Et
 }
 
 fn take_database_error<T: EvmTypes>(evm: &mut Evm<'_, T>, code: ErrorCode) -> DynamicDatabaseError {
-    DynamicDatabaseError::new(evm.database_mut().error(code))
+    DynamicDatabaseError::new(evm.error(code))
 }
 
 struct RethStateSink<'a> {
