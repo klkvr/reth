@@ -429,10 +429,10 @@ reth-zstd-compressors = { version = "0.7.0", default-features = false }
 # revm
 revm = { version = "43.0.2", default-features = false }
 # evm2
-evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "1df15aa062a8d6512c807450435ab9cd80c6f8dd", default-features = false }
-evm2-inspectors = { git = "https://github.com/alloy-rs/evm2", rev = "1df15aa062a8d6512c807450435ab9cd80c6f8dd", default-features = false }
-evm2-jit = { git = "https://github.com/alloy-rs/evm2", rev = "1df15aa062a8d6512c807450435ab9cd80c6f8dd", default-features = false }
-evm2-macros = { git = "https://github.com/alloy-rs/evm2", rev = "1df15aa062a8d6512c807450435ab9cd80c6f8dd" }
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "a557295474f1e03538f5570dc9adfa898649d751", default-features = false }
+evm2-inspectors = { git = "https://github.com/alloy-rs/evm2", rev = "a557295474f1e03538f5570dc9adfa898649d751", default-features = false }
+evm2-jit = { git = "https://github.com/alloy-rs/evm2", rev = "a557295474f1e03538f5570dc9adfa898649d751", default-features = false }
+evm2-macros = { git = "https://github.com/alloy-rs/evm2", rev = "a557295474f1e03538f5570dc9adfa898649d751" }
 
 # eth
 alloy-dyn-abi = "1.6.1"
