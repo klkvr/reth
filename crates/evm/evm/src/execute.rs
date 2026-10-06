@@ -509,7 +509,10 @@ where
         let (db, evm_env) = evm.finish();
 
         // merge all transitions into bundle state
+        let measure_merge = Stamp::read();
         db.merge_transitions(BundleRetention::Reverts);
+        let merge_ticks = measure_merge.elapsed(Stamp::read()).unwrap_or_default();
+        tracing::info!(target: "tempo_phase_measure", merge_ticks, "tempo revm bundle measurement");
 
         // Encode the built BAL once and keep the bytes, so callers don't re-encode it.
         let block_access_list = db.take_built_alloy_bal().map(|bal| {
@@ -626,7 +629,10 @@ where
 
         let result = executor.apply_post_execution_changes()?;
 
+        let measure_merge = Stamp::read();
         self.db.merge_transitions(BundleRetention::Reverts);
+        let merge_ticks = measure_merge.elapsed(Stamp::read()).unwrap_or_default();
+        tracing::info!(target: "tempo_phase_measure", merge_ticks, "tempo revm bundle measurement");
 
         Ok(result)
     }
@@ -649,7 +655,10 @@ where
         let result = executor.execute_block(block.transactions_recovered());
 
         self.db.set_state_hook(None);
+        let measure_merge = Stamp::read();
         self.db.merge_transitions(BundleRetention::Reverts);
+        let merge_ticks = measure_merge.elapsed(Stamp::read()).unwrap_or_default();
+        tracing::info!(target: "tempo_phase_measure", merge_ticks, "tempo revm bundle measurement");
 
         result
     }
@@ -790,5 +799,37 @@ mod tests {
         let db = CacheDB::<EmptyDB>::default();
         let executor = provider.executor(db);
         let _ = executor.execute(&Default::default());
+    }
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+pub(crate) struct Stamp {
+    ticks: u64,
+    cpu: u32,
+}
+impl Stamp {
+    #[inline]
+    pub(crate) fn read() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Measurement branches run on CPUs with RDTSCP. LFENCE prevents the measured
+            // loads from crossing the timestamp boundary; AUX detects thread migration.
+            let mut cpu = 0;
+            let ticks = unsafe {
+                core::arch::x86_64::_mm_lfence();
+                let ticks = core::arch::x86_64::__rdtscp(&mut cpu);
+                core::arch::x86_64::_mm_lfence();
+                ticks
+            };
+            Self { ticks, cpu }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self { ticks: 0, cpu: 0 }
+        }
+    }
+    pub(crate) fn elapsed(self, end: Self) -> Option<u64> {
+        (self.cpu == end.cpu).then(|| end.ticks.checked_sub(self.ticks)).flatten()
     }
 }
