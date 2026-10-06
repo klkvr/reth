@@ -1,16 +1,20 @@
 //! State conversion at the evm2 execution boundary.
 
 use alloc::vec::Vec;
+#[cfg(test)]
+use alloy_primitives::map::AddressSet;
 use alloy_primitives::{
-    map::{hash_map::Entry, AddressMap, AddressSet},
+    map::{hash_map::Entry, AddressMap},
     Address, U256,
 };
+#[cfg(test)]
+use revm::state::Account;
 use revm::{
     database::{
         states::{bundle_state::BundleRetention, StorageSlot, TransitionAccount, TransitionState},
         AccountStatus, BundleState,
     },
-    state::{Account, AccountInfo, Bytecode},
+    state::{AccountInfo, Bytecode},
 };
 
 /// Transaction transitions retained using revm's bundle state model.
@@ -21,13 +25,19 @@ pub struct BlockState {
 }
 
 impl BlockState {
+    /// Returns the accumulated block transitions.
+    pub fn into_transitions(self) -> TransitionState {
+        self.transitions
+    }
+
     /// Creates an empty block accumulator.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Applies a converted transaction to the block's transitions.
-    pub fn commit(&mut self, changes: &TransactionChanges) {
+    #[cfg(test)]
+    pub fn commit_revm(&mut self, changes: &TransactionChanges) {
         self.contracts.extend(changes.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
         for (address, account) in &changes.state {
             self.commit_account(
@@ -46,13 +56,18 @@ impl BlockState {
         }
     }
 
-    /// Streams one finalized native transaction into the block without materializing EVM state.
-    /// Storage callbacks must precede the corresponding account callback, as in evm2 transaction
-    /// streams. Use a fresh sink for each transaction.
-    pub fn transaction_sink(
-        &mut self,
-    ) -> impl evm2::evm::StateChangeSink<Error = core::convert::Infallible> + '_ {
-        BlockStateSink { block: self, storage: AddressMap::default() }
+    /// Applies a transaction's native change stream directly to block transitions.
+    pub fn commit(&mut self, changes: &impl evm2::evm::StateChangeSource) {
+        let Ok(()) = changes.visit(&mut self.transaction_sink(None));
+    }
+
+    /// Streams a native transaction into block transitions and optionally records flat hook
+    /// updates. Storage callbacks must precede the corresponding account callback.
+    pub fn transaction_sink<'a>(
+        &'a mut self,
+        updates: Option<&'a mut crate::EvmState>,
+    ) -> impl evm2::evm::StateChangeSink<Error = core::convert::Infallible> + 'a {
+        BlockStateSink { block: self, storage: AddressMap::default(), updates }
     }
 
     fn commit_account(
@@ -131,6 +146,7 @@ impl BlockState {
 }
 
 /// Materialized transaction changes in revm's EVM state representation.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct TransactionChanges {
     /// State passed to the block accumulator and state-root hooks.
@@ -139,6 +155,7 @@ pub struct TransactionChanges {
     contracts: alloy_primitives::map::B256Map<Bytecode>,
 }
 
+#[cfg(test)]
 impl evm2::evm::StateChangeSink for TransactionChanges {
     type Error = core::convert::Infallible;
     fn bytecode(
@@ -196,6 +213,7 @@ impl evm2::evm::StateChangeSink for TransactionChanges {
 /// until the account's lifecycle is known, avoiding temporary per-account storage hash maps.
 struct BlockStateSink<'a> {
     block: &'a mut BlockState,
+    updates: Option<&'a mut crate::EvmState>,
     storage: AddressMap<(bool, Vec<(U256, StorageSlot)>)>,
 }
 
@@ -208,10 +226,16 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
         code: &evm2::bytecode::Bytecode,
     ) -> Result<(), Self::Error> {
         self.block.contracts.entry(hash).or_insert_with(|| revm_bytecode(code));
+        if let Some(updates) = &mut self.updates {
+            updates.push(crate::StateChange::Bytecode(hash, code.clone()));
+        }
         Ok(())
     }
 
     fn storage_wipe(&mut self, address: Address) -> Result<(), Self::Error> {
+        if let Some(updates) = &mut self.updates {
+            updates.push(crate::StateChange::StorageWipe(address));
+        }
         let (wiped, slots) = self.storage.entry(address).or_default();
         *wiped = true;
         slots.clear();
@@ -221,12 +245,18 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
     fn storage(&mut self, change: evm2::evm::StorageChange) -> Result<(), Self::Error> {
         let (_, slots) = self.storage.entry(change.address).or_default();
         if change.original != change.current {
+            if let Some(updates) = &mut self.updates {
+                updates.push(crate::StateChange::Storage(change));
+            }
             slots.push((change.key, StorageSlot::new_changed(change.original, change.current)));
         }
         Ok(())
     }
 
     fn account(&mut self, change: evm2::evm::AccountChangeRef<'_>) -> Result<(), Self::Error> {
+        if let Some(updates) = &mut self.updates {
+            updates.push(crate::StateChange::account(change));
+        }
         let (wiped, slots) = self.storage.remove(&change.address).unwrap_or_default();
         let mut current = change.current.map(revm_account);
         if let Some(info) = &mut current {
@@ -261,6 +291,7 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
     }
 }
 
+#[cfg(test)]
 fn empty_account() -> Account {
     // Account::from initializes the original-info box directly, without constructing and
     // immediately dropping the default empty bytecode in both account-info values.
@@ -273,6 +304,7 @@ fn empty_account() -> Account {
     })
 }
 
+#[cfg(test)]
 fn update_account(
     account: &mut Account,
     change: evm2::evm::AccountChangeRef<'_>,
@@ -399,6 +431,7 @@ mod tests {
         let info = NativeAccount::default().with_nonce(1).with_code(code.clone());
         let mut converted = BlockState::new();
         let mut native = BlockState::new();
+        let mut replay = BlockState::new();
         // Storage-only writes, restoration, deletion, recreation, a surviving storage wipe,
         // and another deletion exercise both occupied and vacant transition entries.
         for step in 0..7 {
@@ -435,8 +468,12 @@ mod tests {
             };
             let mut changes = TransactionChanges::default();
             visit(&mut changes);
-            converted.commit(&changes);
-            visit(&mut native.transaction_sink());
+            converted.commit_revm(&changes);
+            let mut updates = Vec::new();
+            visit(&mut native.transaction_sink(Some(&mut updates)));
+            replay.commit(&crate::StateChanges(&updates));
+            assert_eq!(replay.transitions, converted.transitions, "replayed step {step}");
+            assert_eq!(replay.contracts, converted.contracts);
             assert_eq!(native.transitions, converted.transitions, "step {step}");
             assert_eq!(native.contracts, converted.contracts);
         }
@@ -514,7 +551,7 @@ mod tests {
                 })
                 .unwrap();
             let mut block = BlockState::new();
-            block.commit(&changes);
+            block.commit_revm(&changes);
             block.into_bundle()
         };
         let uncached = bundle(&info);
@@ -546,7 +583,7 @@ mod tests {
             })
             .unwrap();
         let mut block = BlockState::new();
-        block.commit(&changes);
+        block.commit_revm(&changes);
         let bundle = block.into_bundle();
         assert_eq!(bundle.contracts[&hash].original_bytes(), code.original_bytes());
         assert_eq!(bundle.account(&address).unwrap().info.as_ref().unwrap().code_hash, hash);
@@ -567,7 +604,7 @@ mod tests {
             .unwrap();
         changes.account_read(address, Some(&info)).unwrap();
         let mut block = BlockState::new();
-        block.commit(&changes);
+        block.commit_revm(&changes);
         let mut bundle = block.into_bundle();
         assert_eq!(bundle.account(&address).unwrap().info.as_ref().unwrap().nonce, 1);
         assert_eq!(bundle.storage(&address, U256::from(3)), Some(U256::from(8)));
@@ -592,7 +629,7 @@ mod tests {
                 selfdestructed: true,
             })
             .unwrap();
-        block.commit(&destroyed);
+        block.commit_revm(&destroyed);
         let mut created = TransactionChanges::default();
         created.storage_wipe(address).unwrap();
         created
@@ -612,7 +649,7 @@ mod tests {
                 selfdestructed: false,
             })
             .unwrap();
-        block.commit(&created);
+        block.commit_revm(&created);
         let bundle = block.into_bundle();
         let account = bundle.account(&address).unwrap();
         assert!(account.was_destroyed());

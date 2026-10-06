@@ -739,8 +739,17 @@ fn test_balance_increment_not_duplicated() {
 
     let _output = executor
         .execute_with_state_hook(block, move |state: EvmState| {
-            if let Some(account) = state.get(&withdrawal_recipient) {
-                let _ = tx_clone.send(account.info.balance);
+            for change in state {
+                if let reth_execution_types::StateChange::Account {
+                    address,
+                    current: Some(info),
+                    ..
+                } = change
+                {
+                    if address == withdrawal_recipient {
+                        let _ = tx_clone.send(info.balance);
+                    }
+                }
             }
         })
         .expect("Block execution should succeed");

@@ -57,12 +57,12 @@ mod sparse_trie;
 
 use self::sparse_trie::{SparseTrieCacheTask, SparseTrieTaskMetrics};
 use crate::tree::{metrics::BlockValidationMetrics, EngineApiTreeState, ExecutionEnv, TreeConfig};
-use alloy_evm::block::OnStateHook;
 use alloy_primitives::B256;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use reth_chain_state::{ExecutedBlock, PreservedSparseTrie};
 use reth_errors::ProviderResult;
 use reth_evm::ConfigureEvm;
+use reth_execution_types::OnStateHook;
 use reth_primitives_traits::{
     AlloyBlockHeader, FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedHeader,
 };
@@ -1302,6 +1302,7 @@ mod tests {
     use reth_ethereum_primitives::EthPrimitives;
     use reth_evm::OnStateHook;
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_execution_types::{native_account, StateChange};
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_provider::{
         providers::BlockchainProvider, test_utils::create_test_provider_factory_with_chain_spec,
@@ -1365,6 +1366,36 @@ mod tests {
             published_sparse_trie_anchor_hash(parent_hash, false, Some(&blocks)),
             parent_hash
         );
+    }
+
+    fn native_fixture(state: revm::state::EvmState) -> reth_execution_types::EvmState {
+        let mut updates = Vec::new();
+        for (address, a) in state.into_iter().filter(|(_, a)| a.is_touched()) {
+            let created = a.is_created();
+            let selfdestructed = a.is_selfdestructed();
+            if created || selfdestructed {
+                updates.push(StateChange::StorageWipe(address));
+            }
+            for (&key, slot) in &a.storage {
+                if slot.is_changed() {
+                    updates.push(StateChange::Storage(evm2::evm::StorageChange {
+                        address,
+                        key,
+                        original: slot.original_value,
+                        current: slot.present_value,
+                    }));
+                }
+            }
+            updates.push(StateChange::Account {
+                address,
+                original: (!a.is_loaded_as_not_existing())
+                    .then(|| native_account(&a.original_info())),
+                current: (!selfdestructed).then(|| native_account(&a.info)),
+                created,
+                selfdestructed,
+            });
+        }
+        updates
     }
 
     fn create_mock_state_updates(num_accounts: usize, updates_per_account: usize) -> Vec<EvmState> {
@@ -1480,7 +1511,7 @@ mod tests {
 
         let mut state_hook = state_root_handle.take_execution_hook();
         for update in state_updates {
-            state_hook.on_state(update);
+            state_hook.on_state(native_fixture(update));
         }
         drop(state_hook);
 

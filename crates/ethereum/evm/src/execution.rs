@@ -1,5 +1,5 @@
 //! EVM-backed Ethereum execution helpers.
-use reth_execution_types::{BlockState, EvmState, TransactionChanges};
+use reth_execution_types::{BlockState, EvmState};
 
 use alloy_evm::eth::dao_fork;
 
@@ -158,6 +158,7 @@ fn send_state_update(state: EvmState, on_state_update: &mut impl FnMut(EvmState)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn execute_transaction_with_condition<T: EvmTypes>(
     evm: &mut Evm<'_, T>,
     block_state: &mut BlockState,
@@ -169,15 +170,99 @@ pub(crate) fn execute_transaction_with_condition<T: EvmTypes>(
 where
     T::Tx: Typed2718,
 {
-    let mut changes = TransactionChanges::default();
+    execute_transaction_with_condition_and_state_sink(
+        evm,
+        block_state,
+        stream_state,
+        on_state_update,
+        transaction,
+        None,
+        commit,
+    )
+}
+
+struct ObservedStateSink<'a, S> {
+    inner: S,
+    observer: Option<&'a mut dyn StateChangeSink<Error = core::convert::Infallible>>,
+}
+impl<S: StateChangeSink<Error = core::convert::Infallible>> StateChangeSink
+    for ObservedStateSink<'_, S>
+{
+    type Error = core::convert::Infallible;
+    fn bytecode(&mut self, hash: B256, code: &evm2::bytecode::Bytecode) -> Result<(), Self::Error> {
+        self.inner.bytecode(hash, code)?;
+        if let Some(observer) = &mut self.observer {
+            observer.bytecode(hash, code)?;
+        }
+        Ok(())
+    }
+    fn storage_wipe(&mut self, address: Address) -> Result<(), Self::Error> {
+        self.inner.storage_wipe(address)?;
+        if let Some(observer) = &mut self.observer {
+            observer.storage_wipe(address)?;
+        }
+        Ok(())
+    }
+    fn storage(&mut self, change: evm2::evm::StorageChange) -> Result<(), Self::Error> {
+        self.inner.storage(change)?;
+        if let Some(observer) = &mut self.observer {
+            observer.storage(change)?;
+        }
+        Ok(())
+    }
+    fn account(&mut self, change: AccountChangeRef<'_>) -> Result<(), Self::Error> {
+        self.inner.account(change)?;
+        if let Some(observer) = &mut self.observer {
+            observer.account(change)?;
+        }
+        Ok(())
+    }
+    fn account_read(
+        &mut self,
+        address: Address,
+        info: Option<&AccountInfo>,
+    ) -> Result<(), Self::Error> {
+        self.inner.account_read(address, info)?;
+        if let Some(observer) = &mut self.observer {
+            observer.account_read(address, info)?;
+        }
+        Ok(())
+    }
+    fn storage_read(
+        &mut self,
+        address: Address,
+        key: U256,
+        value: U256,
+    ) -> Result<(), Self::Error> {
+        self.inner.storage_read(address, key, value)?;
+        if let Some(observer) = &mut self.observer {
+            observer.storage_read(address, key, value)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn execute_transaction_with_condition_and_state_sink<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
+    block_state: &mut BlockState,
+    stream_state: bool,
+    on_state_update: &mut impl FnMut(EvmState),
+    transaction: &Recovered<T::Tx>,
+    observer: Option<&mut dyn StateChangeSink<Error = core::convert::Infallible>>,
+    commit: impl FnOnce(&TxResult<T>) -> reth_evm::CommitChanges,
+) -> Result<Option<TxResult<T>>, HandlerError>
+where
+    T::Tx: Typed2718,
+{
+    let mut changes = EvmState::default();
     let result = match evm.transact(transaction) {
         Ok(executed) => {
             if commit(executed.result()).should_commit() {
-                let Ok(result) = if stream_state {
-                    executed.commit_with(&mut changes)
-                } else {
-                    executed.commit_with(&mut block_state.transaction_sink())
+                let mut sink = ObservedStateSink {
+                    inner: block_state.transaction_sink(stream_state.then_some(&mut changes)),
+                    observer,
                 };
+                let Ok(result) = executed.commit_with(&mut sink);
                 Ok(Some(result))
             } else {
                 let _ = executed.discard();
@@ -187,8 +272,7 @@ where
         Err(error) => Err(error),
     };
     if stream_state {
-        block_state.commit(&changes);
-        send_state_update(changes.state, on_state_update);
+        send_state_update(changes, on_state_update);
     }
     result
 }
@@ -237,12 +321,11 @@ fn accumulate_pending_state(
     pending_state: &evm2::evm::PendingState,
 ) {
     if stream_state {
-        let mut changes = TransactionChanges::default();
-        let Ok(()) = pending_state.visit(&mut changes);
-        block_state.commit(&changes);
-        send_state_update(changes.state, on_state_update);
+        let mut changes = EvmState::default();
+        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink(Some(&mut changes)));
+        send_state_update(changes, on_state_update);
     } else {
-        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink());
+        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink(None));
     }
 }
 
@@ -449,8 +532,13 @@ fn execute_system_call<T: EvmTypes>(
         }
         .into());
     }
-    let outcome = executed.detach();
-    Ok(commit_detached_transaction(evm, block_state, stream_state, on_state_update, outcome))
+    let mut updates = EvmState::new();
+    let Ok(result) = executed
+        .commit_with(&mut block_state.transaction_sink(stream_state.then_some(&mut updates)));
+    if stream_state {
+        send_state_update(updates, on_state_update);
+    }
+    Ok(result)
 }
 
 fn commit_state_changes<T: EvmTypes>(
@@ -460,7 +548,8 @@ fn commit_state_changes<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     changes: &[(Address, Option<AccountInfo>, Option<AccountInfo>)],
 ) {
-    let mut converted = TransactionChanges::default();
+    let mut converted = EvmState::default();
+    let mut sink = block_state.transaction_sink(stream_state.then_some(&mut converted));
     for (address, original, current) in changes {
         let change = AccountChangeRef {
             address: *address,
@@ -470,11 +559,11 @@ fn commit_state_changes<T: EvmTypes>(
             selfdestructed: false,
         };
         let Ok(()) = evm.overlay_db_mut().account(change);
-        let Ok(()) = converted.account(change);
+        let Ok(()) = sink.account(change);
     }
-    block_state.commit(&converted);
+    drop(sink);
     if stream_state {
-        send_state_update(converted.state, on_state_update);
+        send_state_update(converted, on_state_update);
     }
 }
 

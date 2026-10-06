@@ -11303,6 +11303,7 @@ dependencies = [
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-execution-errors",
+ "reth-execution-types",
  "reth-metrics",
  "reth-primitives-traits",
  "reth-provider",

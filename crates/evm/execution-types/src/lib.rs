@@ -16,7 +16,9 @@ pub use evm2::evm::{
     StateChangeSink as EvmStateChangeSink, StorageChange as ExecutionStorageChange,
 };
 pub use reth_trie_common::HashedPostState;
-pub use revm::state::EvmState;
+
+mod native_state;
+pub use native_state::*;
 
 mod compat;
 pub use compat::*;
