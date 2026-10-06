@@ -702,6 +702,17 @@ mod tests {
                 assert_eq!(bundle.storage(&contract, U256::ZERO), Some(U256::from(2)));
                 assert_eq!(updates.len(), if stream_state { 2 } else { 0 });
                 if stream_state {
+                    // Account callbacks follow hash-map iteration order, which may differ after
+                    // detaching and recycling buffers. Compare their contents in address order.
+                    for update in &mut updates {
+                        let accounts = update.partition_point(|change| {
+                            !matches!(change, reth_execution_types::StateChange::Account { .. })
+                        });
+                        update[accounts..].sort_by_key(|change| match change {
+                            reth_execution_types::StateChange::Account { address, .. } => *address,
+                            _ => unreachable!("this fixture emits account callbacks last"),
+                        });
+                    }
                     assert_eq!(expected_updates.get_or_insert_with(|| updates.clone()), &updates);
                 }
                 let output = (bundle, evm.state_mut().take_bal_builder());
