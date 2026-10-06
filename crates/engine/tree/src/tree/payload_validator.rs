@@ -1080,6 +1080,7 @@ where
         executor.evm_mut().db_mut().set_state_hook(state_hook);
 
         let execution_start = Instant::now();
+        let measure_block = MeasurementStamp::read();
 
         // Execute all transactions and finalize
         let (executor, senders) = self.execute_transactions(
@@ -1100,8 +1101,13 @@ where
         self.metrics.record_post_execution(post_exec_start.elapsed());
 
         // Merge transitions into bundle state
+        let measure_merge = MeasurementStamp::read();
         debug_span!(target: "engine::tree", "merge_transitions")
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
+        let merge_ticks = measure_merge.elapsed(MeasurementStamp::read()).unwrap_or_default();
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), merge_ticks,
+            "tempo revm bundle measurement");
 
         // The builder only exists when the block declares a BAL. The revm form is the one shared
         // with the executed block, so it must survive here; the clone only feeds the
@@ -1112,6 +1118,10 @@ where
         });
         let output = BlockExecutionOutput { result, state: db.take_bundle() };
 
+        let block_ticks = measure_block.elapsed(MeasurementStamp::read()).unwrap_or_default();
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), block_ticks,
+            gas = output.result.gas_used, txs = transaction_count, "tempo validator total measurement");
         let execution_duration = execution_start.elapsed();
         self.metrics.record_block_execution(&output, execution_duration);
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
@@ -2133,4 +2143,35 @@ struct ExecutedBal {
     alloy: BlockAccessList,
     /// Revm form, shared with the executed block so consumers can reuse it.
     revm: Arc<RevmBal>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MeasurementStamp {
+    ticks: u64,
+    cpu: u32,
+}
+impl MeasurementStamp {
+    #[inline]
+    pub(crate) fn read() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Measurement branches run on CPUs with RDTSCP. LFENCE prevents the measured
+            // loads from crossing the timestamp boundary; AUX detects thread migration.
+            let mut cpu = 0;
+            let ticks = unsafe {
+                core::arch::x86_64::_mm_lfence();
+                let ticks = core::arch::x86_64::__rdtscp(&mut cpu);
+                core::arch::x86_64::_mm_lfence();
+                ticks
+            };
+            Self { ticks, cpu }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self { ticks: 0, cpu: 0 }
+        }
+    }
+    fn elapsed(self, end: Self) -> Option<u64> {
+        (self.cpu == end.cpu).then(|| end.ticks.checked_sub(self.ticks)).flatten()
+    }
 }
