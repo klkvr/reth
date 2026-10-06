@@ -13,7 +13,6 @@ use alloy_rpc_types_trace::geth::{
     TraceResult,
 };
 use async_trait::async_trait;
-use evm2::evm::StateChangeSource;
 use evm2_inspectors::tracing::{DebugInspector, TransactionContext};
 use futures::Stream;
 use jsonrpsee::{core::RpcResult, PendingSubscriptionSink, SubscriptionMessage};
@@ -836,10 +835,8 @@ where
                     }
                     let tx_env = eth_api.evm_config().tx_env(tx.cloned());
                     let result = eth_api.transact(&mut db, evm_env.clone(), tx_env)?;
-                    let mut changes = reth_execution_types::TransactionChanges::default();
-                    let Ok(()) = result.pending_state.visit(&mut changes);
                     let mut transaction_state = reth_execution_types::BlockState::default();
-                    transaction_state.commit(&changes);
+                    transaction_state.commit(&result.pending_state);
                     state.extend(transaction_state.into_bundle());
                     db.commit_source(&result.pending_state);
                     let hashed_state = db

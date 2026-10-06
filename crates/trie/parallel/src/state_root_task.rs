@@ -8,14 +8,10 @@
 //! task runs lives in `reth-engine-tree` under `tree::state_root_strategy`.
 
 use crate::error::StateRootTaskError;
-use alloy_evm::block::OnStateHook;
 use alloy_primitives::{keccak256, map::B256Map, B256};
-use reth_trie::{
-    updates::TrieUpdates, HashedPostState, HashedStorage, MultiProofTargetsV2, ProofV2Target,
-};
-use revm::state::EvmState;
+use reth_execution_types::{EvmState, OnStateHook, StateChange};
+use reth_trie::{updates::TrieUpdates, HashedPostState, MultiProofTargetsV2, ProofV2Target};
 use std::{fmt, sync::Arc};
-use tracing::trace;
 
 /// Messages used internally by the multi proof task.
 #[derive(Debug)]
@@ -514,58 +510,264 @@ impl StateRootSink for SparseTrieStateRootSink {
     }
 }
 
-/// Converts [`EvmState`] to [`HashedPostState`] by keccak256-hashing addresses and storage slots.
+/// Hashes finalized native writes using the same account and slot filtering as the legacy hook.
 pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
-    let mut hashed_state = HashedPostState::with_capacity(update.len());
-
-    for (address, account) in update {
-        if account.is_touched() {
-            let hashed_address = keccak256(address);
-            trace!(target: "trie::parallel::sparse", ?address, ?hashed_address, "Adding account to state update");
-
-            let destroyed = account.is_selfdestructed();
-            // EIP-161: a touched account that ends up empty is deleted, so it must be emitted
-            // as a removal rather than as an all-zero account. This mirrors what revm does in
-            // the bundle path (`CacheAccount::touch_empty_eip161`) and what the sibling
-            // producer for this consumer already does in `send_bal_hashed_state`.
-            // An address that never existed and still does not exist is not a deletion: revm
-            // emits no transition for `LoadedNotExisting`. Skipping it matches the bundle
-            // producer; every `None` here becomes a storage-trie cursor walk in `StateRoot`.
-            let deleted = destroyed || (account.is_empty() && !account.is_loaded_as_not_existing());
-            if deleted {
-                hashed_state.accounts.insert(hashed_address, None);
-            } else if account.info != account.original_info() {
-                // A touched but unchanged account produces no bundle transition either.
-                hashed_state.accounts.insert(hashed_address, Some(account.info.into()));
-            }
-
-            let mut changed_storage_iter = account
-                .storage
-                .into_iter()
-                .filter(|(_slot, value)| value.is_changed())
-                .map(|(slot, value)| (keccak256(B256::from(slot)), value.present_value))
-                .peekable();
-
-            if !destroyed && changed_storage_iter.peek().is_some() {
-                hashed_state
+    let mut hashed = HashedPostState::default();
+    for change in update {
+        match change {
+            StateChange::Storage(change) if change.original != change.current => {
+                hashed
                     .storages
-                    .insert(hashed_address, HashedStorage::from_iter(changed_storage_iter));
+                    .entry(keccak256(change.address))
+                    .or_default()
+                    .storage
+                    .insert(keccak256(B256::from(change.key)), change.current);
             }
+            StateChange::Account { address, original, current, .. } => {
+                let address = keccak256(address);
+                let destroyed = current.is_none();
+                let deleted = destroyed ||
+                    (original.is_some() && current.as_ref().is_some_and(|info| info.is_empty()));
+                let changed = current.as_ref().is_some_and(|info| {
+                    original.as_ref().map_or_else(|| !info.is_empty(), |original| original != info)
+                });
+                if deleted {
+                    hashed.accounts.insert(address, None);
+                } else if changed {
+                    hashed.accounts.insert(
+                        address,
+                        current.map(|info| reth_primitives_traits::Account {
+                            balance: info.balance,
+                            nonce: info.nonce,
+                            bytecode_hash: (info.code_hash != alloy_primitives::KECCAK256_EMPTY &&
+                                info.code_hash != B256::ZERO)
+                                .then_some(info.code_hash),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                if destroyed {
+                    hashed.storages.remove(&address);
+                }
+            }
+            _ => {}
         }
     }
-
-    hashed_state
+    hashed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
+    use evm2::evm::AccountInfo as NativeInfo;
+    use reth_execution_types::native_account;
+    use reth_trie::HashedStorage;
     use revm::state::{Account, EvmStorageSlot, TransactionId};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+
+    fn native_fixture(state: revm::state::EvmState) -> reth_execution_types::EvmState {
+        let mut updates = Vec::new();
+        for (address, a) in state.into_iter().filter(|(_, a)| a.is_touched()) {
+            let created = a.is_created();
+            let selfdestructed = a.is_selfdestructed();
+            if created || selfdestructed {
+                updates.push(StateChange::StorageWipe(address));
+            }
+            for (&key, slot) in &a.storage {
+                if slot.is_changed() {
+                    updates.push(StateChange::Storage(evm2::evm::StorageChange {
+                        address,
+                        key,
+                        original: slot.original_value,
+                        current: slot.present_value,
+                    }));
+                }
+            }
+            updates.push(StateChange::Account {
+                address,
+                original: (!a.is_loaded_as_not_existing())
+                    .then(|| native_account(&a.original_info())),
+                current: (!selfdestructed).then(|| native_account(&a.info)),
+                created,
+                selfdestructed,
+            });
+        }
+        updates
+    }
+
+    /// Converts [`EvmState`] to [`HashedPostState`] by keccak256-hashing addresses and storage
+    /// slots.
+    fn revm_state_to_hashed_post_state(update: revm::state::EvmState) -> HashedPostState {
+        let mut hashed_state = HashedPostState::with_capacity(update.len());
+
+        for (address, account) in update {
+            if account.is_touched() {
+                let hashed_address = keccak256(address);
+                tracing::trace!(target: "trie::parallel::sparse", ?address, ?hashed_address, "Adding account to state update");
+
+                let destroyed = account.is_selfdestructed();
+                // EIP-161: a touched account that ends up empty is deleted, so it must be emitted
+                // as a removal rather than as an all-zero account. This mirrors what revm does in
+                // the bundle path (`CacheAccount::touch_empty_eip161`) and what the sibling
+                // producer for this consumer already does in `send_bal_hashed_state`.
+                // An address that never existed and still does not exist is not a deletion: revm
+                // emits no transition for `LoadedNotExisting`. Skipping it matches the bundle
+                // producer; every `None` here becomes a storage-trie cursor walk in `StateRoot`.
+                let deleted =
+                    destroyed || (account.is_empty() && !account.is_loaded_as_not_existing());
+                if deleted {
+                    hashed_state.accounts.insert(hashed_address, None);
+                } else if account.info != account.original_info() {
+                    // A touched but unchanged account produces no bundle transition either.
+                    hashed_state.accounts.insert(hashed_address, Some(account.info.into()));
+                }
+
+                let mut changed_storage_iter = account
+                    .storage
+                    .into_iter()
+                    .filter(|(_slot, value)| value.is_changed())
+                    .map(|(slot, value)| (keccak256(B256::from(slot)), value.present_value))
+                    .peekable();
+
+                if !destroyed && changed_storage_iter.peek().is_some() {
+                    hashed_state
+                        .storages
+                        .insert(hashed_address, HashedStorage::from_iter(changed_storage_iter));
+                }
+            }
+        }
+
+        hashed_state
+    }
+
+    #[test]
+    fn native_hook_matches_legacy_account_and_storage_updates() {
+        #[derive(Default)]
+        struct AccountUpdate {
+            original: Option<NativeInfo>,
+            current: Option<NativeInfo>,
+            created: bool,
+            selfdestructed: bool,
+            wiped: bool,
+            storage: Vec<(U256, U256, U256)>,
+        }
+
+        let address = alloy_primitives::Address::with_last_byte(1);
+        let original = NativeInfo::empty().with_nonce(1).with_balance(U256::from(10));
+        let changed = NativeInfo::empty().with_nonce(2).with_balance(U256::from(9));
+        let cases = [
+            // Ordinary writes, including setting a slot to zero.
+            AccountUpdate {
+                original: Some(original.clone()),
+                current: Some(changed.clone()),
+                storage: vec![
+                    (U256::from(1), U256::from(5), U256::from(7)),
+                    (U256::from(2), U256::from(3), U256::ZERO),
+                ],
+                ..Default::default()
+            },
+            // Storage-only writes must retain unchanged account metadata for the hook.
+            AccountUpdate {
+                original: Some(original.clone()),
+                current: Some(original.clone()),
+                storage: vec![(U256::ZERO, U256::from(5), U256::from(7))],
+                ..Default::default()
+            },
+            // A reverted-to-original slot must not be hashed as a write.
+            AccountUpdate {
+                original: Some(original.clone()),
+                current: Some(original.clone()),
+                storage: vec![(U256::ZERO, U256::from(5), U256::from(5))],
+                ..Default::default()
+            },
+            // The legacy hook treats existing empty accounts as deletions.
+            AccountUpdate {
+                original: Some(NativeInfo::empty()),
+                current: Some(NativeInfo::empty()),
+                storage: vec![(U256::ZERO, U256::ZERO, U256::from(7))],
+                ..Default::default()
+            },
+            // Empty newly materialized accounts do not produce a metadata update.
+            AccountUpdate {
+                current: Some(NativeInfo::empty()),
+                created: true,
+                ..Default::default()
+            },
+            // New accounts.
+            AccountUpdate {
+                current: Some(changed.clone()),
+                created: true,
+                storage: vec![(U256::ZERO, U256::ZERO, U256::from(7))],
+                ..Default::default()
+            },
+            // Deletion suppresses slot updates; the account removal drives storage deletion.
+            AccountUpdate {
+                original: Some(original.clone()),
+                wiped: true,
+                selfdestructed: true,
+                storage: vec![(U256::ZERO, U256::from(5), U256::ZERO)],
+                ..Default::default()
+            },
+            // Keep the legacy deletion marker for creation and deletion in one transaction.
+            AccountUpdate {
+                created: true,
+                selfdestructed: true,
+                wiped: true,
+                ..Default::default()
+            },
+        ];
+        for account in cases {
+            let mut a = account
+                .original
+                .as_ref()
+                .map(reth_execution_types::revm_account)
+                .map_or_else(|| Account::new_not_existing(TransactionId::ZERO), Account::from);
+            a.info = account
+                .current
+                .as_ref()
+                .map(reth_execution_types::revm_account)
+                .unwrap_or_default();
+            a.mark_touch();
+            if account.created {
+                a.mark_created();
+            }
+            if account.current.is_none() {
+                a.mark_selfdestruct();
+            }
+            for &(key, original, current) in &account.storage {
+                a.storage.insert(
+                    key,
+                    EvmStorageSlot::new_changed(original, current, TransactionId::ZERO),
+                );
+            }
+            let legacy = revm::state::EvmState::from_iter([(address, a)]);
+            let mut update = EvmState::new();
+            if account.wiped {
+                update.push(StateChange::StorageWipe(address));
+            }
+            for &(key, original, current) in &account.storage {
+                update.push(StateChange::Storage(evm2::evm::StorageChange {
+                    address,
+                    key,
+                    original,
+                    current,
+                }));
+            }
+            update.push(StateChange::Account {
+                address,
+                original: account.original,
+                current: account.current,
+                created: account.created,
+                selfdestructed: account.selfdestructed,
+            });
+            let expected = revm_state_to_hashed_post_state(legacy);
+            assert_eq!(evm_state_to_hashed_post_state(update), expected);
+        }
+    }
 
     #[test]
     fn created_selfdestruct_does_not_emit_storage() {
@@ -580,8 +782,9 @@ mod tests {
             EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO),
         );
 
-        let hashed_state =
-            evm_state_to_hashed_post_state(EvmState::from_iter([(address, account)]));
+        let hashed_state = evm_state_to_hashed_post_state(native_fixture(
+            revm::state::EvmState::from_iter([(address, account)]),
+        ));
         let hashed_address = keccak256(address);
 
         assert_eq!(hashed_state.accounts.get(&hashed_address), Some(&None));
@@ -602,8 +805,9 @@ mod tests {
             EvmStorageSlot::new_changed(U256::ZERO, U256::from(2), TransactionId::ZERO),
         );
 
-        let hashed_state =
-            evm_state_to_hashed_post_state(EvmState::from_iter([(address, account)]));
+        let hashed_state = evm_state_to_hashed_post_state(native_fixture(
+            revm::state::EvmState::from_iter([(address, account)]),
+        ));
         let hashed_address = keccak256(address);
 
         assert_eq!(hashed_state.accounts.get(&hashed_address), Some(&None));
@@ -627,8 +831,9 @@ mod tests {
         assert!(account.is_empty(), "the drained account must be EIP-161-empty");
         assert!(!account.is_selfdestructed());
 
-        let hashed_state =
-            evm_state_to_hashed_post_state(EvmState::from_iter([(address, account)]));
+        let hashed_state = evm_state_to_hashed_post_state(native_fixture(
+            revm::state::EvmState::from_iter([(address, account)]),
+        ));
 
         assert_eq!(hashed_state.accounts.get(&keccak256(address)), Some(&None));
     }
@@ -646,8 +851,9 @@ mod tests {
         account.mark_touch();
         assert!(account.is_empty());
 
-        let hashed_state =
-            evm_state_to_hashed_post_state(EvmState::from_iter([(address, account)]));
+        let hashed_state = evm_state_to_hashed_post_state(native_fixture(
+            revm::state::EvmState::from_iter([(address, account)]),
+        ));
 
         assert_eq!(hashed_state.accounts.get(&keccak256(address)), Some(&None));
     }
@@ -676,7 +882,7 @@ mod tests {
         let mut account = Account::from(pre.clone());
         account.mark_touch();
         account.info.balance = U256::ZERO;
-        let evm_state = EvmState::from_iter([(address, account)]);
+        let evm_state = revm::state::EvmState::from_iter([(address, account)]);
 
         // Same execution, through revm's own bundle machinery.
         let mut db = State::builder().with_bundle_update().build();
@@ -687,7 +893,7 @@ mod tests {
 
         let from_bundle =
             HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(bundle.state.iter());
-        let from_hook = evm_state_to_hashed_post_state(evm_state);
+        let from_hook = evm_state_to_hashed_post_state(native_fixture(evm_state));
 
         assert_eq!(
             from_hook.accounts, from_bundle.accounts,
@@ -709,7 +915,7 @@ mod tests {
         account.mark_touch();
         assert!(account.mark_created_locally());
         assert!(account.is_empty());
-        let evm_state = EvmState::from_iter([(address, account)]);
+        let evm_state = revm::state::EvmState::from_iter([(address, account)]);
 
         let mut db = State::builder().with_bundle_update().build();
         db.commit(evm_state.clone());
@@ -718,7 +924,7 @@ mod tests {
 
         let from_bundle =
             HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(bundle.state.iter());
-        let from_hook = evm_state_to_hashed_post_state(evm_state);
+        let from_hook = evm_state_to_hashed_post_state(native_fixture(evm_state));
 
         assert_eq!(
             from_hook.accounts.get(&keccak256(address)).and_then(Option::as_ref),
@@ -741,7 +947,7 @@ mod tests {
         let address = Address::repeat_byte(0x09);
         let mut account = Account::new_not_existing(TransactionId::default());
         account.mark_touch();
-        let evm_state = EvmState::from_iter([(address, account)]);
+        let evm_state = revm::state::EvmState::from_iter([(address, account)]);
 
         let mut db = State::builder().with_bundle_update().build();
         db.commit(evm_state.clone());
@@ -750,7 +956,7 @@ mod tests {
 
         let from_bundle =
             HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(bundle.state.iter());
-        let from_hook = evm_state_to_hashed_post_state(evm_state);
+        let from_hook = evm_state_to_hashed_post_state(native_fixture(evm_state));
 
         assert_eq!(
             from_hook.accounts, from_bundle.accounts,
@@ -774,7 +980,7 @@ mod tests {
         let mut account = Account::from(pre.clone());
         account.mark_touch();
         assert!(!account.is_empty());
-        let evm_state = EvmState::from_iter([(address, account)]);
+        let evm_state = revm::state::EvmState::from_iter([(address, account)]);
 
         let mut db = State::builder().with_bundle_update().build();
         db.insert_account(address, pre);
@@ -784,7 +990,7 @@ mod tests {
 
         let from_bundle =
             HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(bundle.state.iter());
-        let from_hook = evm_state_to_hashed_post_state(evm_state);
+        let from_hook = evm_state_to_hashed_post_state(native_fixture(evm_state));
 
         assert_eq!(
             from_hook.accounts, from_bundle.accounts,
