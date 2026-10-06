@@ -739,16 +739,11 @@ fn test_balance_increment_not_duplicated() {
 
     let _output = executor
         .execute_with_state_hook(block, move |state: EvmState| {
-            for change in state {
-                if let reth_execution_types::StateChange::Account {
-                    address,
-                    current: Some(info),
-                    ..
-                } = change
+            for (change, _) in state.changed_accounts() {
+                if change.address == withdrawal_recipient &&
+                    let Some(info) = change.current
                 {
-                    if address == withdrawal_recipient {
-                        let _ = tx_clone.send(info.balance);
-                    }
+                    let _ = tx_clone.send(info.balance);
                 }
             }
         })

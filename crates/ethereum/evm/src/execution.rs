@@ -1,5 +1,5 @@
 //! EVM-backed Ethereum execution helpers.
-use reth_execution_types::{BlockState, EvmState};
+use reth_execution_types::{BlockState, EvmState, StateChange, StateChanges};
 
 use alloy_evm::eth::dao_fork;
 
@@ -20,8 +20,8 @@ use alloy_sol_types::{sol, SolEvent};
 use core::any::Any;
 use evm2::{
     evm::{
-        AccountChangeRef, AccountInfo, StateChangeSink, StateChangeSource, SystemTx,
-        BEACON_ROOTS_ADDRESS, BUILDER_DEPOSIT_REQUEST_ADDRESS, BUILDER_EXIT_REQUEST_ADDRESS,
+        AccountChangeRef, AccountInfo, StateChangeSink, SystemTx, BEACON_ROOTS_ADDRESS,
+        BUILDER_DEPOSIT_REQUEST_ADDRESS, BUILDER_EXIT_REQUEST_ADDRESS,
         CONSOLIDATION_REQUEST_ADDRESS, HISTORY_STORAGE_ADDRESS, WITHDRAWAL_REQUEST_ADDRESS,
     },
     interpreter::InstrStop,
@@ -153,8 +153,14 @@ pub(crate) fn map_transaction_error(error: HandlerError, hash: B256) -> BlockExe
 }
 
 fn send_state_update(state: EvmState, on_state_update: &mut impl FnMut(EvmState)) {
-    if !state.is_empty() {
+    if state.changed_accounts().next().is_some() || state.changed_bytecodes().next().is_some() {
         on_state_update(state);
+    }
+}
+
+fn send_flat_state_update(state: Vec<StateChange>, on_state_update: &mut impl FnMut(EvmState)) {
+    if !state.is_empty() {
+        on_state_update(EvmState::from_source(&StateChanges(&state)));
     }
 }
 
@@ -169,7 +175,7 @@ pub(crate) fn execute_transaction_with_condition<T: EvmTypes>(
 where
     T::Tx: Typed2718,
 {
-    let mut changes = EvmState::default();
+    let mut changes = Vec::new();
     let result = match evm.transact(transaction) {
         Ok(executed) => {
             if commit(executed.result()).should_commit() {
@@ -184,7 +190,7 @@ where
         Err(error) => Err(error),
     };
     if stream_state {
-        send_state_update(changes, on_state_update);
+        send_flat_state_update(changes, on_state_update);
     }
     result
 }
@@ -207,11 +213,19 @@ pub(crate) fn commit_detached_transaction<T: EvmTypes>(
     output: TxResultWithState<T>,
 ) -> TxResult<T> {
     let TxResultWithState { result, pending_state, .. } = output;
-    accumulate_pending_state(block_state, stream_state, on_state_update, &pending_state);
-    // Reattach the finalized transaction so evm2 retains its account capacity and recycles
-    // storage maps for the next transaction instead of dropping the detached allocations.
-    evm.state_mut().set_pending_state(pending_state);
-    evm.state_mut().commit_transaction();
+    block_state.commit_pending(&pending_state, None);
+    let hook_state = if stream_state {
+        // Apply the native output by reference, then transfer that same output to the hook.
+        evm.overlay_db_mut().commit_pending(&pending_state);
+        Some(pending_state)
+    } else {
+        evm.state_mut().set_pending_state(pending_state);
+        evm.state_mut().commit_transaction();
+        None
+    };
+    if let Some(state) = hook_state {
+        send_state_update(state, on_state_update);
+    }
     result
 }
 
@@ -222,22 +236,10 @@ pub(crate) fn commit_pending_state<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     pending_state: &evm2::evm::PendingState,
 ) {
-    accumulate_pending_state(block_state, stream_state, on_state_update, pending_state);
+    block_state.commit_pending(pending_state, None);
     evm.overlay_db_mut().commit_pending(pending_state);
-}
-
-fn accumulate_pending_state(
-    block_state: &mut BlockState,
-    stream_state: bool,
-    on_state_update: &mut impl FnMut(EvmState),
-    pending_state: &evm2::evm::PendingState,
-) {
     if stream_state {
-        let mut changes = EvmState::default();
-        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink(Some(&mut changes)));
-        send_state_update(changes, on_state_update);
-    } else {
-        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink(None));
+        send_state_update(pending_state.clone(), on_state_update);
     }
 }
 
@@ -444,11 +446,11 @@ fn execute_system_call<T: EvmTypes>(
         }
         .into());
     }
-    let mut updates = EvmState::new();
+    let mut updates = Vec::new();
     let Ok(result) = executed
         .commit_with(&mut block_state.transaction_sink(stream_state.then_some(&mut updates)));
     if stream_state {
-        send_state_update(updates, on_state_update);
+        send_flat_state_update(updates, on_state_update);
     }
     Ok(result)
 }
@@ -460,7 +462,7 @@ fn commit_state_changes<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     changes: &[(Address, Option<AccountInfo>, Option<AccountInfo>)],
 ) {
-    let mut converted = EvmState::default();
+    let mut converted = Vec::new();
     let mut sink = block_state.transaction_sink(stream_state.then_some(&mut converted));
     for (address, original, current) in changes {
         let change = AccountChangeRef {
@@ -475,7 +477,7 @@ fn commit_state_changes<T: EvmTypes>(
     }
     drop(sink);
     if stream_state {
-        send_state_update(converted, on_state_update);
+        send_flat_state_update(converted, on_state_update);
     }
 }
 
@@ -702,17 +704,25 @@ mod tests {
                 assert_eq!(bundle.storage(&contract, U256::ZERO), Some(U256::from(2)));
                 assert_eq!(updates.len(), if stream_state { 2 } else { 0 });
                 if stream_state {
-                    // Account callbacks follow hash-map iteration order, which may differ after
-                    // detaching and recycling buffers. Compare their contents in address order.
-                    for update in &mut updates {
-                        let accounts = update.partition_point(|change| {
-                            !matches!(change, reth_execution_types::StateChange::Account { .. })
-                        });
-                        update[accounts..].sort_by_key(|change| match change {
-                            reth_execution_types::StateChange::Account { address, .. } => *address,
-                            _ => unreachable!("this fixture emits account callbacks last"),
-                        });
-                    }
+                    // Compare semantic changes; pending states also retain read entries and
+                    // execution-only warmth flags that are not part of hook updates.
+                    let updates = updates
+                        .iter()
+                        .map(|update| {
+                            let mut changes = Vec::new();
+                            let mut scratch = BlockState::new();
+                            scratch.commit_pending(update, Some(&mut changes));
+                            changes.sort_by_key(|change| match change {
+                                StateChange::Storage(change) => (0, change.address, change.key),
+                                StateChange::StorageWipe(address) => (1, *address, U256::ZERO),
+                                StateChange::Account { address, .. } => (2, *address, U256::ZERO),
+                                StateChange::Bytecode(hash, _) => {
+                                    (3, Address::ZERO, U256::from_be_bytes(hash.0))
+                                }
+                            });
+                            changes
+                        })
+                        .collect::<Vec<_>>();
                     assert_eq!(expected_updates.get_or_insert_with(|| updates.clone()), &updates);
                 }
                 let output = (bundle, evm.state_mut().take_bal_builder());
@@ -771,7 +781,7 @@ mod tests {
         assert_eq!(without_hook, output);
         let mut streamed = BlockState::new();
         for update in rx.try_iter() {
-            streamed.commit(&reth_execution_types::StateChanges(&update));
+            streamed.commit(&update);
         }
         let streamed =
             HashedPostState::from_bundle_state::<KeccakKeyHasher>(&streamed.into_bundle().state);
