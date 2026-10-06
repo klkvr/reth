@@ -69,6 +69,19 @@ impl BlockState {
         pending: &evm2::evm::PendingState,
         mut updates: Option<&mut crate::EvmState>,
     ) {
+        if let Some(updates) = &mut updates {
+            // Reserve once before emitting updates. Loaded slots give a cheap upper bound;
+            // filtering changed slots here would scan each storage map an extra time.
+            let capacity = pending
+                .changed_accounts()
+                .map(|(_, storage)| {
+                    1 + storage
+                        .map_or(0, |storage| storage.slots.len() + usize::from(storage.wiped))
+                })
+                .sum::<usize>() +
+                pending.changed_bytecodes().count();
+            updates.reserve(capacity);
+        }
         for (hash, code) in pending.changed_bytecodes() {
             self.contracts.entry(hash).or_insert_with(|| revm_bytecode(code));
             if let Some(updates) = &mut updates {
