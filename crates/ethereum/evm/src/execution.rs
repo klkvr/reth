@@ -158,7 +158,6 @@ fn send_state_update(state: EvmState, on_state_update: &mut impl FnMut(EvmState)
     }
 }
 
-#[cfg(test)]
 pub(crate) fn execute_transaction_with_condition<T: EvmTypes>(
     evm: &mut Evm<'_, T>,
     block_state: &mut BlockState,
@@ -170,98 +169,11 @@ pub(crate) fn execute_transaction_with_condition<T: EvmTypes>(
 where
     T::Tx: Typed2718,
 {
-    execute_transaction_with_condition_and_state_sink(
-        evm,
-        block_state,
-        stream_state,
-        on_state_update,
-        transaction,
-        None,
-        commit,
-    )
-}
-
-struct ObservedStateSink<'a, S> {
-    inner: S,
-    observer: Option<&'a mut dyn StateChangeSink<Error = core::convert::Infallible>>,
-}
-impl<S: StateChangeSink<Error = core::convert::Infallible>> StateChangeSink
-    for ObservedStateSink<'_, S>
-{
-    type Error = core::convert::Infallible;
-    fn bytecode(&mut self, hash: B256, code: &evm2::bytecode::Bytecode) -> Result<(), Self::Error> {
-        self.inner.bytecode(hash, code)?;
-        if let Some(observer) = &mut self.observer {
-            observer.bytecode(hash, code)?;
-        }
-        Ok(())
-    }
-    fn storage_wipe(&mut self, address: Address) -> Result<(), Self::Error> {
-        self.inner.storage_wipe(address)?;
-        if let Some(observer) = &mut self.observer {
-            observer.storage_wipe(address)?;
-        }
-        Ok(())
-    }
-    fn storage(&mut self, change: evm2::evm::StorageChange) -> Result<(), Self::Error> {
-        self.inner.storage(change)?;
-        if let Some(observer) = &mut self.observer {
-            observer.storage(change)?;
-        }
-        Ok(())
-    }
-    fn account(&mut self, change: AccountChangeRef<'_>) -> Result<(), Self::Error> {
-        self.inner.account(change)?;
-        if let Some(observer) = &mut self.observer {
-            observer.account(change)?;
-        }
-        Ok(())
-    }
-    fn account_read(
-        &mut self,
-        address: Address,
-        info: Option<&AccountInfo>,
-    ) -> Result<(), Self::Error> {
-        self.inner.account_read(address, info)?;
-        if let Some(observer) = &mut self.observer {
-            observer.account_read(address, info)?;
-        }
-        Ok(())
-    }
-    fn storage_read(
-        &mut self,
-        address: Address,
-        key: U256,
-        value: U256,
-    ) -> Result<(), Self::Error> {
-        self.inner.storage_read(address, key, value)?;
-        if let Some(observer) = &mut self.observer {
-            observer.storage_read(address, key, value)?;
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn execute_transaction_with_condition_and_state_sink<T: EvmTypes>(
-    evm: &mut Evm<'_, T>,
-    block_state: &mut BlockState,
-    stream_state: bool,
-    on_state_update: &mut impl FnMut(EvmState),
-    transaction: &Recovered<T::Tx>,
-    observer: Option<&mut dyn StateChangeSink<Error = core::convert::Infallible>>,
-    commit: impl FnOnce(&TxResult<T>) -> reth_evm::CommitChanges,
-) -> Result<Option<TxResult<T>>, HandlerError>
-where
-    T::Tx: Typed2718,
-{
     let mut changes = EvmState::default();
     let result = match evm.transact(transaction) {
         Ok(executed) => {
             if commit(executed.result()).should_commit() {
-                let mut sink = ObservedStateSink {
-                    inner: block_state.transaction_sink(stream_state.then_some(&mut changes)),
-                    observer,
-                };
+                let mut sink = block_state.transaction_sink(stream_state.then_some(&mut changes));
                 let Ok(result) = executed.commit_with(&mut sink);
                 Ok(Some(result))
             } else {
