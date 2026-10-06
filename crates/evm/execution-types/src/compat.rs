@@ -113,8 +113,10 @@ impl BlockState {
                 let account = entry.get_mut();
                 account.info = current;
                 account.status = status;
-                // Match TransitionAccount::update: deletion starts a new storage lifetime.
-                if matches!(status, AccountStatus::Destroyed | AccountStatus::DestroyedAgain) {
+                // A storage wipe or account deletion starts a new storage lifetime.
+                if wiped ||
+                    matches!(status, AccountStatus::Destroyed | AccountStatus::DestroyedAgain)
+                {
                     account.storage.clear();
                     account.storage.extend(storage);
                     account.storage_was_destroyed = true;
@@ -267,7 +269,13 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
     }
 
     fn storage(&mut self, change: evm2::evm::StorageChange) -> Result<(), Self::Error> {
-        if change.original != change.current {
+        if change.original != change.current ||
+            (!change.current.is_zero() &&
+                self.block
+                    .pending_storage
+                    .get(&change.address)
+                    .is_some_and(|(wiped, _)| *wiped))
+        {
             if let Some(updates) = &mut self.updates {
                 updates.push(crate::StateChange::Storage(change));
             }
@@ -453,6 +461,51 @@ mod tests {
     use evm2::evm::{
         AccountChangeRef, AccountInfo as NativeAccount, StateChangeSink, StorageChange,
     };
+
+    #[test]
+    fn wiped_storage_matches_native_accumulator() {
+        use evm2::evm::{BlockStateAccumulator, StateChangeSource};
+        let address = Address::with_last_byte(1);
+        let mut native = BlockStateAccumulator::new();
+        let mut block = BlockState::new();
+        for step in 0..2 {
+            let original = NativeAccount::empty().with_nonce(1 + step);
+            let current = NativeAccount::empty().with_nonce(2 + step);
+            let apply = |sink: &mut dyn StateChangeSink<Error = core::convert::Infallible>| {
+                if step == 1 {
+                    sink.storage_wipe(address).unwrap();
+                }
+                sink.storage(StorageChange {
+                    address,
+                    key: U256::from(step),
+                    original: if step == 0 { U256::ZERO } else { U256::from(7) },
+                    current: U256::from(7),
+                })
+                .unwrap();
+                sink.account(AccountChangeRef {
+                    address,
+                    original: Some(&original),
+                    current: Some(&current),
+                    created: false,
+                    selfdestructed: false,
+                })
+                .unwrap();
+            };
+            apply(&mut native);
+            apply(&mut block.transaction_sink(None));
+        }
+        let transition = &block.transitions.transitions[&address];
+        let expected =
+            native.storage().map(|(key, value)| (key.key(), value.current)).collect::<Vec<_>>();
+        assert_eq!(transition.storage.len(), expected.len());
+        for (key, value) in expected {
+            assert_eq!(transition.storage[&key].present_value(), value);
+        }
+        assert!(transition.storage_was_destroyed);
+        let mut replay = BlockState::new();
+        let Ok(()) = native.visit(&mut replay.transaction_sink(None));
+        assert_eq!(replay.transitions.transitions[&address].storage, transition.storage);
+    }
 
     #[test]
     fn dropped_sink_does_not_carry_storage_into_next_transaction() {
