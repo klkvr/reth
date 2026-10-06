@@ -1026,6 +1026,7 @@ where
         let (receipt_tx, result_rx) = self.spawn_receipt_root_task(transaction_count);
         let executed_tx_index = Arc::clone(handle.executed_tx_index());
         let execution_start = Instant::now();
+        let measure_block = MeasurementStamp::read();
         let evm_config =
             self.evm_config.clone().with_jit_support().with_precompile_cache_metrics(true);
         let execution_ctx = self.execution_ctx_for(input).map_err(BlockExecutionError::other)?;
@@ -1059,6 +1060,10 @@ where
         let built_bal =
             built_bal.map(|bal| ExecutedBal { alloy: bal.clone().into(), evm: Arc::new(bal) });
 
+        let block_ticks = measure_block.elapsed(MeasurementStamp::read()).unwrap_or_default();
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), block_ticks,
+            gas = output.result.gas_used, txs = transaction_count, "tempo validator total measurement");
         let execution_duration = execution_start.elapsed();
         self.metrics.record_block_execution(&output, execution_duration);
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
@@ -2052,4 +2057,35 @@ struct ExecutedBal {
     alloy: BlockAccessList,
     /// evm2 form, shared with the executed block so consumers can reuse it.
     evm: Arc<EvmBal>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MeasurementStamp {
+    ticks: u64,
+    cpu: u32,
+}
+impl MeasurementStamp {
+    #[inline]
+    pub(crate) fn read() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Measurement branches run on CPUs with RDTSCP. LFENCE prevents the measured
+            // loads from crossing the timestamp boundary; AUX detects thread migration.
+            let mut cpu = 0;
+            let ticks = unsafe {
+                core::arch::x86_64::_mm_lfence();
+                let ticks = core::arch::x86_64::__rdtscp(&mut cpu);
+                core::arch::x86_64::_mm_lfence();
+                ticks
+            };
+            Self { ticks, cpu }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self { ticks: 0, cpu: 0 }
+        }
+    }
+    fn elapsed(self, end: Self) -> Option<u64> {
+        (self.cpu == end.cpu).then(|| end.ticks.checked_sub(self.ticks)).flatten()
+    }
 }

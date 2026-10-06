@@ -708,4 +708,5 @@ mod tests {
     }
 }
 
-mod commit_measure;
+#[doc(hidden)]
+pub mod commit_measure;

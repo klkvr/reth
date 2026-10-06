@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[derive(Clone, Copy)]
 pub(crate) struct Stamp {
     ticks: u64,
@@ -39,12 +39,14 @@ struct Stats {
     dropped: u64,
 }
 thread_local! { static STATS: RefCell<Stats> = RefCell::new(Stats::default()); }
+thread_local! { static SELECTED: Cell<bool> = const { Cell::new(false) }; }
+/// Selects a nested commit measurement from the outer executor's randomized sample.
+pub fn select(selected: bool) {
+    SELECTED.with(|value| value.set(selected));
+}
 pub(crate) fn start() -> Option<Stamp> {
-    STATS.with(|stats| {
-        let mut stats = stats.borrow_mut();
-        stats.count += 1;
-        (cfg!(target_arch = "x86_64") && stats.count % 64 == 0).then(Stamp::read)
-    })
+    STATS.with(|stats| stats.borrow_mut().count += 1);
+    SELECTED.with(|value| value.get()).then(Stamp::read)
 }
 pub(crate) fn record(start: Option<Stamp>, middle: Option<Stamp>) {
     if let (Some(start), Some(middle)) = (start, middle) {
