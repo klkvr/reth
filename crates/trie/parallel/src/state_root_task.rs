@@ -9,7 +9,9 @@
 
 use crate::error::StateRootTaskError;
 use alloy_primitives::{keccak256, map::B256Map, B256};
-use reth_execution_types::{EvmState, OnStateHook, StateChange};
+#[cfg(test)]
+use reth_execution_types::StateChange;
+use reth_execution_types::{EvmState, OnStateHook};
 use reth_trie::{updates::TrieUpdates, HashedPostState, MultiProofTargetsV2, ProofV2Target};
 use std::{fmt, sync::Arc};
 
@@ -486,64 +488,39 @@ impl StateRootSink for SparseTrieStateRootSink {
 /// Hashes finalized native account and slot writes for the asynchronous state-root task.
 pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
     let mut hashed = HashedPostState::default();
-    let mut wiped = alloy_primitives::map::AddressSet::default();
-    let mut updates = update.into_iter();
-    while let Some(change) = updates.next() {
-        match change {
-            StateChange::StorageWipe(address) => {
-                wiped.insert(address);
-                hashed.storages.remove(&keccak256(address));
+    for (change, storage) in update.changed_accounts() {
+        let address = keccak256(change.address);
+        if let Some(storage) = storage {
+            let mut slots = storage.changed_slots().peekable();
+            if slots.peek().is_some() {
+                let out = hashed.storages.entry(address).or_default();
+                out.storage
+                    .extend(slots.map(|(key, slot)| (keccak256(B256::from(*key)), slot.current)));
             }
-            StateChange::Storage(change) => {
-                let was_wiped = wiped.contains(&change.address);
-                if change.original == change.current && !was_wiped {
-                    continue;
-                }
-                let storage =
-                    &mut hashed.storages.entry(keccak256(change.address)).or_default().storage;
-                storage.insert(keccak256(B256::from(change.key)), change.current);
-                // Native sources emit each account's slots contiguously. Hash the address and
-                // find its destination once per group, while accepting fragmented streams too.
-                while let Some(StateChange::Storage(next)) = updates.as_slice().first() {
-                    if next.address != change.address {
-                        break;
-                    }
-                    let Some(StateChange::Storage(next)) = updates.next() else {
-                        unreachable!("the next change was a storage slot")
-                    };
-                    if next.original != next.current || was_wiped {
-                        storage.insert(keccak256(B256::from(next.key)), next.current);
-                    }
-                }
-            }
-            StateChange::Account { address, original, current, .. } => {
-                let address = keccak256(address);
-                let destroyed = current.is_none();
-                let deleted = destroyed ||
-                    (original.is_some() && current.as_ref().is_some_and(|info| info.is_empty()));
-                let changed = current.as_ref().is_some_and(|info| {
-                    original.as_ref().map_or_else(|| !info.is_empty(), |original| original != info)
-                });
-                if deleted {
-                    hashed.accounts.insert(address, None);
-                } else if changed {
-                    hashed.accounts.insert(
-                        address,
-                        current.map(|info| reth_primitives_traits::Account {
-                            balance: info.balance,
-                            nonce: info.nonce,
-                            bytecode_hash: (info.code_hash != alloy_primitives::KECCAK256_EMPTY &&
-                                info.code_hash != B256::ZERO)
-                                .then_some(info.code_hash),
-                            ..Default::default()
-                        }),
-                    );
-                }
-                if destroyed {
-                    hashed.storages.remove(&address);
-                }
-            }
-            _ => {}
+        }
+        let destroyed = change.current.is_none();
+        let deleted = destroyed ||
+            (change.original.is_some() && change.current.is_some_and(|info| info.is_empty()));
+        let changed = change.current.is_some_and(|info| {
+            change.original.map_or_else(|| !info.is_empty(), |original| original != info)
+        });
+        if deleted {
+            hashed.accounts.insert(address, None);
+        } else if changed {
+            hashed.accounts.insert(
+                address,
+                change.current.map(|info| reth_primitives_traits::Account {
+                    balance: info.balance,
+                    nonce: info.nonce,
+                    bytecode_hash: (info.code_hash != alloy_primitives::KECCAK256_EMPTY &&
+                        info.code_hash != B256::ZERO)
+                        .then_some(info.code_hash),
+                    ..Default::default()
+                }),
+            );
+        }
+        if destroyed {
+            hashed.storages.remove(&address);
         }
     }
     hashed
@@ -589,7 +566,7 @@ mod tests {
                 selfdestructed,
             });
         }
-        updates
+        EvmState::from_source(&reth_execution_types::StateChanges(&updates))
     }
 
     /// Converts [`EvmState`] to [`HashedPostState`] by keccak256-hashing addresses and storage
@@ -648,7 +625,7 @@ mod tests {
             account.mark_touch();
             legacy.insert(address, account);
         }
-        let mut updates = EvmState::new();
+        let mut updates = Vec::new();
         for (address, key, original, current) in [
             (first, 0, 0, 0),
             (first, 1, 0, 7),
@@ -681,7 +658,9 @@ mod tests {
             });
         }
         assert_eq!(
-            evm_state_to_hashed_post_state(updates),
+            evm_state_to_hashed_post_state(EvmState::from_source(
+                &reth_execution_types::StateChanges(&updates)
+            )),
             revm_state_to_hashed_post_state(legacy)
         );
     }
@@ -691,7 +670,7 @@ mod tests {
         let address = alloy_primitives::Address::with_last_byte(1);
         let slot = U256::from(2);
         let value = U256::from(7);
-        let mut updates = EvmState::new();
+        let mut updates = Vec::new();
         updates.push(StateChange::Storage(evm2::evm::StorageChange {
             address,
             key: U256::ZERO,
@@ -713,7 +692,9 @@ mod tests {
             created: false,
             selfdestructed: false,
         });
-        let hashed = evm_state_to_hashed_post_state(updates);
+        let hashed = evm_state_to_hashed_post_state(EvmState::from_source(
+            &reth_execution_types::StateChanges(&updates),
+        ));
         let storage = &hashed.storages[&keccak256(address)];
         assert_eq!(storage.storage.len(), 1);
         assert_eq!(storage.storage[&keccak256(B256::from(slot))], value);
@@ -820,7 +801,7 @@ mod tests {
                 );
             }
             let legacy = revm::state::EvmState::from_iter([(address, a)]);
-            let mut update = EvmState::new();
+            let mut update = Vec::new();
             if account.wiped {
                 update.push(StateChange::StorageWipe(address));
             }
@@ -840,7 +821,12 @@ mod tests {
                 selfdestructed: account.selfdestructed,
             });
             let expected = revm_state_to_hashed_post_state(legacy);
-            assert_eq!(evm_state_to_hashed_post_state(update), expected);
+            assert_eq!(
+                evm_state_to_hashed_post_state(EvmState::from_source(
+                    &reth_execution_types::StateChanges(&update)
+                )),
+                expected
+            );
         }
     }
 

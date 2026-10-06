@@ -1,5 +1,6 @@
-//! Flat owned native changes for asynchronous execution hooks.
+//! Native execution output for asynchronous execution hooks.
 
+#[cfg(test)]
 use alloc::vec::Vec;
 use alloy_primitives::{Address, B256};
 use evm2::{
@@ -7,10 +8,10 @@ use evm2::{
     evm::{AccountChangeRef, AccountInfo, StateChangeSink, StateChangeSource, StorageChange},
 };
 
-/// Flat transaction updates. Block accumulation consumes the original source directly.
-pub type EvmState = Vec<StateChange>;
+/// The detached native transaction output, transferred to hooks after cache and block commit.
+pub type EvmState = evm2::evm::PendingState;
 
-/// One owned callback from an evm2 transaction's change stream.
+/// One owned callback used to bridge flat system updates and diagnostic sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateChange {
     /// Changed code needed by consumers retaining block transitions.
@@ -79,7 +80,7 @@ impl StateChangeSource for StateChanges<'_> {
 
 /// Receives finalized native transaction updates.
 pub trait OnStateHook {
-    /// Processes one transaction's flat changes.
+    /// Processes one transaction's owned native state.
     fn on_state(&mut self, state: EvmState);
 }
 impl<F: FnMut(EvmState)> OnStateHook for F {
