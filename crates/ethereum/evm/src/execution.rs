@@ -206,12 +206,15 @@ pub(crate) fn commit_detached_transaction<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     output: TxResultWithState<T>,
 ) -> TxResult<T> {
+    let measure_start = crate::commit_measure::start();
     let TxResultWithState { result, pending_state, .. } = output;
     accumulate_pending_state(block_state, stream_state, on_state_update, &pending_state);
+    let measure_accumulated = measure_start.map(|_| crate::commit_measure::Stamp::read());
     // Reattach the finalized transaction so evm2 retains its account capacity and recycles
     // storage maps for the next transaction instead of dropping the detached allocations.
     evm.state_mut().set_pending_state(pending_state);
     evm.state_mut().commit_transaction();
+    crate::commit_measure::record(measure_start, measure_accumulated);
     result
 }
 

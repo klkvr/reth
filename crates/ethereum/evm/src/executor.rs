@@ -434,6 +434,7 @@ where
             self.block_regular_gas_used,
             self.block_state_gas_used,
         );
+        crate::commit_measure::emit();
         let output = BlockExecutionOutput::new(
             BlockExecutionResult {
                 receipts: self.receipts,
