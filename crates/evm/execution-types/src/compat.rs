@@ -63,6 +63,51 @@ impl BlockState {
         let Ok(()) = changes.visit(&mut self.transaction_sink(None));
     }
 
+    /// Applies borrowed account-grouped pending changes without storage scratch buffers.
+    pub fn commit_pending(
+        &mut self,
+        pending: &evm2::evm::PendingState,
+        mut updates: Option<&mut crate::EvmState>,
+    ) {
+        for (hash, code) in pending.changed_bytecodes() {
+            self.contracts.entry(hash).or_insert_with(|| revm_bytecode(code));
+            if let Some(updates) = &mut updates {
+                updates.push(crate::StateChange::Bytecode(hash, code.clone()));
+            }
+        }
+        for (change, storage) in pending.changed_accounts() {
+            let wiped = storage.is_some_and(|s| s.wiped);
+            if wiped && let Some(updates) = &mut updates {
+                updates.push(crate::StateChange::StorageWipe(change.address));
+            }
+            let mut current = change.current.map(revm_account);
+            if let Some(info) = &mut current {
+                info.code = self.contracts.get(&info.code_hash).cloned();
+            }
+            self.commit_account(
+                change.address,
+                change.original.map(revm_account),
+                current,
+                change.created,
+                wiped,
+                storage.into_iter().flat_map(|s| s.changed_slots()).map(|(key, slot)| {
+                    if let Some(updates) = &mut updates {
+                        updates.push(crate::StateChange::Storage(evm2::evm::StorageChange {
+                            address: change.address,
+                            key: *key,
+                            original: slot.original,
+                            current: slot.current,
+                        }));
+                    }
+                    (*key, StorageSlot::new_changed(slot.original, slot.current))
+                }),
+            );
+            if let Some(updates) = &mut updates {
+                updates.push(crate::StateChange::account(change));
+            }
+        }
+    }
+
     /// Streams a native transaction into block transitions and optionally records flat hook
     /// updates. Storage callbacks must precede the corresponding account callback.
     pub fn transaction_sink<'a>(
@@ -461,6 +506,49 @@ mod tests {
     use evm2::evm::{
         AccountChangeRef, AccountInfo as NativeAccount, StateChangeSink, StorageChange,
     };
+
+    #[test]
+    fn grouped_pending_matches_flat_commit_and_hook_across_transactions() {
+        let mut grouped = BlockState::new();
+        let mut flat = BlockState::new();
+        for step in 0..3 {
+            let mut pending = evm2::evm::PendingState::default();
+            for i in 1..4 {
+                let address = Address::with_last_byte(i);
+                let original = NativeAccount::empty().with_nonce(1);
+                let current = if i == 1 {
+                    NativeAccount::empty().with_nonce(2 + step)
+                } else {
+                    original.clone()
+                };
+                pending.insert_account(address, Some(original), Some(current));
+                // Mix metadata-only updates, storage-only updates, reads, and restoration
+                // of a slot to its block-boundary value.
+                if i == 2 {
+                    pending.insert_storage(
+                        address,
+                        U256::from(1),
+                        U256::from(7 + step),
+                        U256::from(if step == 2 { 7 } else { 8 + step }),
+                    );
+                    pending.insert_storage(address, U256::from(2), U256::from(9), U256::from(9));
+                }
+            }
+            let mut grouped_hook = Vec::new();
+            let mut flat_hook = Vec::new();
+            grouped.commit_pending(&pending, Some(&mut grouped_hook));
+            let Ok(()) = evm2::evm::StateChangeSource::visit(
+                &pending,
+                &mut flat.transaction_sink(Some(&mut flat_hook)),
+            );
+            assert_eq!(grouped.transitions.transitions, flat.transitions.transitions);
+            assert_eq!(grouped_hook.len(), flat_hook.len());
+            for change in grouped_hook {
+                assert!(flat_hook.contains(&change));
+            }
+        }
+        assert_eq!(grouped.into_bundle(), flat.into_bundle());
+    }
 
     #[test]
     fn wiped_storage_matches_native_accumulator() {

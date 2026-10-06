@@ -36,6 +36,8 @@ struct Stats {
     samples: u64,
     accumulate_ticks: u64,
     cache_ticks: u64,
+    build_ticks: u64,
+    hook_ticks: u64,
     dropped: u64,
 }
 thread_local! { static STATS: RefCell<Stats> = RefCell::new(Stats::default()); }
@@ -48,15 +50,22 @@ pub(crate) fn start() -> Option<Stamp> {
     STATS.with(|stats| stats.borrow_mut().count += 1);
     SELECTED.with(|value| value.get()).then(Stamp::read)
 }
-pub(crate) fn record(start: Option<Stamp>, middle: Option<Stamp>) {
-    if let (Some(start), Some(middle)) = (start, middle) {
+pub(crate) fn record(start: Option<Stamp>, built: Option<Stamp>, middle: Option<Stamp>) {
+    if let (Some(start), Some(built), Some(middle)) = (start, built, middle) {
         let end = Stamp::read();
         STATS.with(|stats| {
             let mut stats = stats.borrow_mut();
-            if let (Some(accumulate), Some(cache)) = (start.elapsed(middle), middle.elapsed(end)) {
+            if let (Some(accumulate), Some(cache), Some(build), Some(hook)) = (
+                start.elapsed(middle),
+                middle.elapsed(end),
+                start.elapsed(built),
+                built.elapsed(middle),
+            ) {
                 stats.samples += 1;
                 stats.accumulate_ticks += accumulate;
                 stats.cache_ticks += cache;
+                stats.build_ticks += build;
+                stats.hook_ticks += hook;
             } else {
                 stats.dropped += 1;
             }
@@ -69,6 +78,7 @@ pub(crate) fn emit() {
         tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
             thread_name = std::thread::current().name().unwrap_or("unknown"), count = stats.count, samples = stats.samples,
             accumulate_ticks = stats.accumulate_ticks, cache_ticks = stats.cache_ticks,
+            build_ticks = stats.build_ticks, hook_ticks = stats.hook_ticks,
             dropped_samples = stats.dropped, "tempo native commit measurement");
     });
 }

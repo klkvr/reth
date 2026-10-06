@@ -208,13 +208,19 @@ pub(crate) fn commit_detached_transaction<T: EvmTypes>(
 ) -> TxResult<T> {
     let measure_start = crate::commit_measure::start();
     let TxResultWithState { result, pending_state, .. } = output;
-    accumulate_pending_state(block_state, stream_state, on_state_update, &pending_state);
+    let measure_built = accumulate_pending_state(
+        block_state,
+        stream_state,
+        on_state_update,
+        &pending_state,
+        measure_start,
+    );
     let measure_accumulated = measure_start.map(|_| crate::commit_measure::Stamp::read());
     // Reattach the finalized transaction so evm2 retains its account capacity and recycles
     // storage maps for the next transaction instead of dropping the detached allocations.
     evm.state_mut().set_pending_state(pending_state);
     evm.state_mut().commit_transaction();
-    crate::commit_measure::record(measure_start, measure_accumulated);
+    crate::commit_measure::record(measure_start, measure_built, measure_accumulated);
     result
 }
 
@@ -225,7 +231,7 @@ pub(crate) fn commit_pending_state<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     pending_state: &evm2::evm::PendingState,
 ) {
-    accumulate_pending_state(block_state, stream_state, on_state_update, pending_state);
+    accumulate_pending_state(block_state, stream_state, on_state_update, pending_state, None);
     evm.overlay_db_mut().commit_pending(pending_state);
 }
 
@@ -234,13 +240,17 @@ fn accumulate_pending_state(
     stream_state: bool,
     on_state_update: &mut impl FnMut(EvmState),
     pending_state: &evm2::evm::PendingState,
-) {
+    measure_start: Option<crate::commit_measure::Stamp>,
+) -> Option<crate::commit_measure::Stamp> {
     if stream_state {
         let mut changes = EvmState::default();
-        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink(Some(&mut changes)));
+        block_state.commit_pending(pending_state, Some(&mut changes));
+        let measure_built = measure_start.map(|_| crate::commit_measure::Stamp::read());
         send_state_update(changes, on_state_update);
+        measure_built
     } else {
-        let Ok(()) = pending_state.visit(&mut block_state.transaction_sink(None));
+        block_state.commit_pending(pending_state, None);
+        measure_start.map(|_| crate::commit_measure::Stamp::read())
     }
 }
 
