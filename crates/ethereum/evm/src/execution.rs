@@ -606,7 +606,7 @@ mod tests {
     use super::*;
     use alloy_consensus::{SignableTransaction, TxLegacy, TxType};
     use alloy_genesis::Genesis;
-    use alloy_primitives::{address, keccak256, Signature, TxKind};
+    use alloy_primitives::{address, Signature, TxKind};
     use evm2::{
         bytecode::Bytecode, env::BlockEnv as EvmBlockEnv, evm::InMemoryDB, interpreter::opcode::op,
     };
@@ -758,30 +758,12 @@ mod tests {
             .batch_executor(database)
             .execute_with_state_hook(&block, move |state| tx.send(state).unwrap())?;
         assert_eq!(without_hook, output);
-        let mut streamed = HashedPostState::default();
+        let mut streamed = BlockState::new();
         for update in rx.try_iter() {
-            for (address, account) in update {
-                let hash = keccak256(address);
-                if account.is_selfdestructed() || account.info != account.original_info() {
-                    streamed.accounts.insert(
-                        hash,
-                        (!account.is_selfdestructed()).then(|| account.info.clone().into()),
-                    );
-                }
-                if !account.is_selfdestructed() {
-                    for (key, value) in account.storage {
-                        if value.is_changed() {
-                            streamed
-                                .storages
-                                .entry(hash)
-                                .or_default()
-                                .storage
-                                .insert(keccak256(B256::from(key)), value.present_value);
-                        }
-                    }
-                }
-            }
+            streamed.commit(&reth_execution_types::StateChanges(&update));
         }
+        let streamed =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(&streamed.into_bundle().state);
         let recomputed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(&output.state.state);
         assert_eq!(streamed.into_sorted(), recomputed.into_sorted());
         Ok(output)
