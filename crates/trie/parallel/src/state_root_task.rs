@@ -510,15 +510,24 @@ impl StateRootSink for SparseTrieStateRootSink {
     }
 }
 
-/// Hashes finalized native writes using the same account and slot filtering as the legacy hook.
+/// Hashes finalized native account and slot writes for the asynchronous state-root task.
 pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
     let mut hashed = HashedPostState::default();
+    let mut wiped = alloy_primitives::map::AddressSet::default();
     for change in update {
         match change {
-            StateChange::Storage(change) if change.original != change.current => {
+            StateChange::StorageWipe(address) => {
+                wiped.insert(address);
+                hashed.storages.remove(&keccak256(address));
+            }
+            StateChange::Storage(change) => {
+                let address = keccak256(change.address);
+                if change.original == change.current && !wiped.contains(&change.address) {
+                    continue;
+                }
                 hashed
                     .storages
-                    .entry(keccak256(change.address))
+                    .entry(address)
                     .or_default()
                     .storage
                     .insert(keccak256(B256::from(change.key)), change.current);
@@ -642,6 +651,39 @@ mod tests {
         }
 
         hashed_state
+    }
+
+    #[test]
+    fn native_hook_reinserts_equal_nonzero_slots_after_wipe() {
+        let address = alloy_primitives::Address::with_last_byte(1);
+        let slot = U256::from(2);
+        let value = U256::from(7);
+        let mut updates = EvmState::new();
+        updates.push(StateChange::Storage(evm2::evm::StorageChange {
+            address,
+            key: U256::ZERO,
+            original: U256::ZERO,
+            current: value,
+        }));
+        updates.push(StateChange::StorageWipe(address));
+        updates.push(StateChange::Storage(evm2::evm::StorageChange {
+            address,
+            key: slot,
+            original: value,
+            current: value,
+        }));
+        let info = NativeInfo::empty().with_nonce(1);
+        updates.push(StateChange::Account {
+            address,
+            original: Some(info.clone()),
+            current: Some(info),
+            created: false,
+            selfdestructed: false,
+        });
+        let hashed = evm_state_to_hashed_post_state(updates);
+        let storage = &hashed.storages[&keccak256(address)];
+        assert_eq!(storage.storage.len(), 1);
+        assert_eq!(storage.storage[&keccak256(B256::from(slot))], value);
     }
 
     #[test]

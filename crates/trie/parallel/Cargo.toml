@@ -54,6 +54,9 @@ reth-provider = { workspace = true, features = ["test-utils"] }
 reth-storage-overlay.workspace = true
 reth-trie = { workspace = true, features = ["test-utils"] }
 
+# evm
+evm2.workspace = true
+
 # misc
 rand.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
