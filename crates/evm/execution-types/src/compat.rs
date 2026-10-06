@@ -22,6 +22,8 @@ use revm::{
 pub struct BlockState {
     transitions: TransitionState,
     contracts: alloy_primitives::map::B256Map<Bytecode>,
+    pending_storage: AddressMap<(bool, Vec<(U256, StorageSlot)>)>,
+    spare_storage: Vec<Vec<(U256, StorageSlot)>>,
 }
 
 impl BlockState {
@@ -67,7 +69,7 @@ impl BlockState {
         &'a mut self,
         updates: Option<&'a mut crate::EvmState>,
     ) -> impl evm2::evm::StateChangeSink<Error = core::convert::Infallible> + 'a {
-        BlockStateSink { block: self, storage: AddressMap::default(), updates }
+        BlockStateSink { block: self, updates }
     }
 
     fn commit_account(
@@ -214,7 +216,29 @@ impl evm2::evm::StateChangeSink for TransactionChanges {
 struct BlockStateSink<'a> {
     block: &'a mut BlockState,
     updates: Option<&'a mut crate::EvmState>,
-    storage: AddressMap<(bool, Vec<(U256, StorageSlot)>)>,
+}
+
+impl BlockStateSink<'_> {
+    fn storage_entry(&mut self, address: Address) -> &mut (bool, Vec<(U256, StorageSlot)>) {
+        let spare = &mut self.block.spare_storage;
+        self.block
+            .pending_storage
+            .entry(address)
+            .or_insert_with(|| (false, spare.pop().unwrap_or_default()))
+    }
+}
+
+impl Drop for BlockStateSink<'_> {
+    fn drop(&mut self) {
+        // A source may stop before emitting account metadata. Keep its scratch capacity,
+        // but never carry its uncommitted slots into the next transaction.
+        for (_, (_, mut slots)) in self.block.pending_storage.drain() {
+            slots.clear();
+            if slots.capacity() != 0 {
+                self.block.spare_storage.push(slots);
+            }
+        }
+    }
 }
 
 impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
@@ -236,28 +260,31 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
         if let Some(updates) = &mut self.updates {
             updates.push(crate::StateChange::StorageWipe(address));
         }
-        let (wiped, slots) = self.storage.entry(address).or_default();
+        let (wiped, slots) = self.storage_entry(address);
         *wiped = true;
         slots.clear();
         Ok(())
     }
 
     fn storage(&mut self, change: evm2::evm::StorageChange) -> Result<(), Self::Error> {
-        let (_, slots) = self.storage.entry(change.address).or_default();
         if change.original != change.current {
             if let Some(updates) = &mut self.updates {
                 updates.push(crate::StateChange::Storage(change));
             }
-            slots.push((change.key, StorageSlot::new_changed(change.original, change.current)));
+            self.storage_entry(change.address)
+                .1
+                .push((change.key, StorageSlot::new_changed(change.original, change.current)));
         }
         Ok(())
     }
 
+    #[allow(clippy::iter_with_drain)] // Drain retains the buffer for the next transaction.
     fn account(&mut self, change: evm2::evm::AccountChangeRef<'_>) -> Result<(), Self::Error> {
         if let Some(updates) = &mut self.updates {
             updates.push(crate::StateChange::account(change));
         }
-        let (wiped, slots) = self.storage.remove(&change.address).unwrap_or_default();
+        let (wiped, mut slots) =
+            self.block.pending_storage.remove(&change.address).unwrap_or_default();
         let mut current = change.current.map(revm_account);
         if let Some(info) = &mut current {
             info.code = self.block.contracts.get(&info.code_hash).cloned();
@@ -268,8 +295,11 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
             current,
             change.created,
             wiped,
-            slots.into_iter(),
+            slots.drain(..),
         );
+        if slots.capacity() != 0 {
+            self.block.spare_storage.push(slots);
+        }
         Ok(())
     }
 
@@ -278,7 +308,7 @@ impl evm2::evm::StateChangeSink for BlockStateSink<'_> {
         address: Address,
         info: Option<&evm2::evm::AccountInfo>,
     ) -> Result<(), Self::Error> {
-        if self.storage.contains_key(&address) {
+        if self.block.pending_storage.contains_key(&address) {
             self.account(evm2::evm::AccountChangeRef {
                 address,
                 original: info,
@@ -470,6 +500,42 @@ mod tests {
             bundle.state.get(&address).unwrap().info.as_ref().unwrap().extension.as_ref(),
             b"original extension"
         );
+    }
+
+    #[test]
+    fn dropped_sink_does_not_carry_storage_into_next_transaction() {
+        let address = Address::with_last_byte(1);
+        let info = NativeAccount::empty().with_nonce(1);
+        let mut block = BlockState::new();
+        {
+            let mut sink = block.transaction_sink(None);
+            sink.storage_wipe(address).unwrap();
+            sink.storage(StorageChange {
+                address,
+                key: U256::ZERO,
+                original: U256::ZERO,
+                current: U256::from(7),
+            })
+            .unwrap();
+            // Stop before the corresponding account callback.
+        }
+        block.transaction_sink(None).account_read(address, Some(&info)).unwrap();
+        assert!(block.transitions.transitions.is_empty());
+        {
+            let mut sink = block.transaction_sink(None);
+            sink.storage(StorageChange {
+                address,
+                key: U256::from(1),
+                original: U256::ZERO,
+                current: U256::from(9),
+            })
+            .unwrap();
+            sink.account_read(address, Some(&info)).unwrap();
+        }
+        let transition = &block.transitions.transitions[&address];
+        assert!(!transition.storage_was_destroyed);
+        assert_eq!(transition.storage.len(), 1);
+        assert_eq!(transition.storage[&U256::from(1)].present_value(), U256::from(9));
     }
 
     #[test]
