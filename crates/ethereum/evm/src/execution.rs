@@ -213,7 +213,7 @@ pub(crate) fn commit_detached_transaction<T: EvmTypes>(
     output: TxResultWithState<T>,
 ) -> TxResult<T> {
     let TxResultWithState { result, pending_state, .. } = output;
-    block_state.commit_pending(&pending_state, None);
+    block_state.commit_pending(&pending_state);
     let hook_state = if stream_state {
         // Apply the native output by reference, then transfer that same output to the hook.
         evm.overlay_db_mut().commit_pending(&pending_state);
@@ -236,7 +236,7 @@ pub(crate) fn commit_pending_state<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     pending_state: &evm2::evm::PendingState,
 ) {
-    block_state.commit_pending(pending_state, None);
+    block_state.commit_pending(pending_state);
     evm.overlay_db_mut().commit_pending(pending_state);
     if stream_state {
         send_state_update(pending_state.clone(), on_state_update);
@@ -711,7 +711,10 @@ mod tests {
                         .map(|update| {
                             let mut changes = Vec::new();
                             let mut scratch = BlockState::new();
-                            scratch.commit_pending(update, Some(&mut changes));
+                            let Ok(()) = evm2::evm::StateChangeSource::visit(
+                                update,
+                                &mut scratch.transaction_sink(Some(&mut changes)),
+                            );
                             changes.sort_by_key(|change| match change {
                                 StateChange::Storage(change) => (0, change.address, change.key),
                                 StateChange::StorageWipe(address) => (1, *address, U256::ZERO),
