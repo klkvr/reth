@@ -67,7 +67,7 @@ impl BlockState {
     pub fn commit_pending(
         &mut self,
         pending: &evm2::evm::PendingState,
-        mut updates: Option<&mut crate::EvmState>,
+        mut updates: Option<&mut Vec<crate::StateChange>>,
     ) {
         for (hash, code) in pending.changed_bytecodes() {
             self.contracts.entry(hash).or_insert_with(|| revm_bytecode(code));
@@ -112,7 +112,7 @@ impl BlockState {
     /// updates. Storage callbacks must precede the corresponding account callback.
     pub fn transaction_sink<'a>(
         &'a mut self,
-        updates: Option<&'a mut crate::EvmState>,
+        updates: Option<&'a mut Vec<crate::StateChange>>,
     ) -> impl evm2::evm::StateChangeSink<Error = core::convert::Infallible> + 'a {
         BlockStateSink { block: self, updates }
     }
@@ -262,7 +262,7 @@ impl evm2::evm::StateChangeSink for TransactionChanges {
 /// until the account's lifecycle is known, avoiding temporary per-account storage hash maps.
 struct BlockStateSink<'a> {
     block: &'a mut BlockState,
-    updates: Option<&'a mut crate::EvmState>,
+    updates: Option<&'a mut Vec<crate::StateChange>>,
 }
 
 impl BlockStateSink<'_> {

@@ -1395,7 +1395,7 @@ mod tests {
                 selfdestructed,
             });
         }
-        updates
+        reth_execution_types::EvmState::from_source(&reth_execution_types::StateChanges(&updates))
     }
 
     fn create_mock_state_updates(num_accounts: usize, updates_per_account: usize) -> Vec<EvmState> {

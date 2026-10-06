@@ -56,13 +56,13 @@ pub(crate) fn record(start: Option<Stamp>, built: Option<Stamp>, middle: Option<
         STATS.with(|stats| {
             let mut stats = stats.borrow_mut();
             if let (Some(accumulate), Some(cache), Some(build), Some(hook)) = (
-                start.elapsed(middle),
-                middle.elapsed(end),
                 start.elapsed(built),
                 built.elapsed(middle),
+                start.elapsed(built),
+                middle.elapsed(end),
             ) {
                 stats.samples += 1;
-                stats.accumulate_ticks += accumulate;
+                stats.accumulate_ticks += accumulate + hook;
                 stats.cache_ticks += cache;
                 stats.build_ticks += build;
                 stats.hook_ticks += hook;
