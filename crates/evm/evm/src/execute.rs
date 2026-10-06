@@ -512,7 +512,8 @@ where
         let measure_merge = Stamp::read();
         db.merge_transitions(BundleRetention::Reverts);
         let merge_ticks = measure_merge.elapsed(Stamp::read()).unwrap_or_default();
-        tracing::info!(target: "tempo_phase_measure", merge_ticks, "tempo revm bundle measurement");
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), merge_ticks, "tempo revm bundle measurement");
 
         // Encode the built BAL once and keep the bytes, so callers don't re-encode it.
         let block_access_list = db.take_built_alloy_bal().map(|bal| {
@@ -632,7 +633,8 @@ where
         let measure_merge = Stamp::read();
         self.db.merge_transitions(BundleRetention::Reverts);
         let merge_ticks = measure_merge.elapsed(Stamp::read()).unwrap_or_default();
-        tracing::info!(target: "tempo_phase_measure", merge_ticks, "tempo revm bundle measurement");
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), merge_ticks, "tempo revm bundle measurement");
 
         Ok(result)
     }
@@ -658,7 +660,8 @@ where
         let measure_merge = Stamp::read();
         self.db.merge_transitions(BundleRetention::Reverts);
         let merge_ticks = measure_merge.elapsed(Stamp::read()).unwrap_or_default();
-        tracing::info!(target: "tempo_phase_measure", merge_ticks, "tempo revm bundle measurement");
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), merge_ticks, "tempo revm bundle measurement");
 
         result
     }
