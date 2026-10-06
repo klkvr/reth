@@ -64,7 +64,8 @@ pub(crate) fn record(start: Option<Stamp>, middle: Option<Stamp>) {
 pub(crate) fn emit() {
     STATS.with(|stats| {
         let stats = std::mem::take(&mut *stats.borrow_mut());
-        tracing::info!(target: "tempo_phase_measure", count = stats.count, samples = stats.samples,
+        tracing::info!(target: "tempo_phase_measure", thread_id = ?std::thread::current().id(),
+            thread_name = std::thread::current().name().unwrap_or("unknown"), count = stats.count, samples = stats.samples,
             accumulate_ticks = stats.accumulate_ticks, cache_ticks = stats.cache_ticks,
             dropped_samples = stats.dropped, "tempo native commit measurement");
     });
