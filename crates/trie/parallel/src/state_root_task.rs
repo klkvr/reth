@@ -487,23 +487,34 @@ impl StateRootSink for SparseTrieStateRootSink {
 pub fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
     let mut hashed = HashedPostState::default();
     let mut wiped = alloy_primitives::map::AddressSet::default();
-    for change in update {
+    let mut updates = update.into_iter();
+    while let Some(change) = updates.next() {
         match change {
             StateChange::StorageWipe(address) => {
                 wiped.insert(address);
                 hashed.storages.remove(&keccak256(address));
             }
             StateChange::Storage(change) => {
-                let address = keccak256(change.address);
-                if change.original == change.current && !wiped.contains(&change.address) {
+                let was_wiped = wiped.contains(&change.address);
+                if change.original == change.current && !was_wiped {
                     continue;
                 }
-                hashed
-                    .storages
-                    .entry(address)
-                    .or_default()
-                    .storage
-                    .insert(keccak256(B256::from(change.key)), change.current);
+                let storage =
+                    &mut hashed.storages.entry(keccak256(change.address)).or_default().storage;
+                storage.insert(keccak256(B256::from(change.key)), change.current);
+                // Native sources emit each account's slots contiguously. Hash the address and
+                // find its destination once per group, while accepting fragmented streams too.
+                while let Some(StateChange::Storage(next)) = updates.as_slice().first() {
+                    if next.address != change.address {
+                        break;
+                    }
+                    let Some(StateChange::Storage(next)) = updates.next() else {
+                        unreachable!("the next change was a storage slot")
+                    };
+                    if next.original != next.current || was_wiped {
+                        storage.insert(keccak256(B256::from(next.key)), next.current);
+                    }
+                }
             }
             StateChange::Account { address, original, current, .. } => {
                 let address = keccak256(address);
@@ -624,6 +635,55 @@ mod tests {
         }
 
         hashed_state
+    }
+
+    #[test]
+    fn native_hook_grouping_accepts_fragmented_storage() {
+        let first = alloy_primitives::Address::with_last_byte(1);
+        let second = alloy_primitives::Address::with_last_byte(2);
+        let info = NativeInfo::empty().with_nonce(1);
+        let mut legacy = revm::state::EvmState::default();
+        for address in [first, second] {
+            let mut account = Account::from(reth_execution_types::revm_account(&info));
+            account.mark_touch();
+            legacy.insert(address, account);
+        }
+        let mut updates = EvmState::new();
+        for (address, key, original, current) in [
+            (first, 0, 0, 0),
+            (first, 1, 0, 7),
+            (second, 0, 0, 8),
+            (first, 2, 9, 0),
+            (first, 3, 4, 4),
+            (second, 1, 0, 9),
+        ] {
+            let (key, original, current) =
+                (U256::from(key), U256::from(original), U256::from(current));
+            legacy
+                .get_mut(&address)
+                .unwrap()
+                .storage
+                .insert(key, EvmStorageSlot::new_changed(original, current, TransactionId::ZERO));
+            updates.push(StateChange::Storage(evm2::evm::StorageChange {
+                address,
+                key,
+                original,
+                current,
+            }));
+        }
+        for address in [first, second] {
+            updates.push(StateChange::Account {
+                address,
+                original: Some(info.clone()),
+                current: Some(info.clone()),
+                created: false,
+                selfdestructed: false,
+            });
+        }
+        assert_eq!(
+            evm_state_to_hashed_post_state(updates),
+            revm_state_to_hashed_post_state(legacy)
+        );
     }
 
     #[test]
