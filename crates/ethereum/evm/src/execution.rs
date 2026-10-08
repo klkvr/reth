@@ -212,12 +212,11 @@ pub(crate) fn commit_detached_transaction<T: EvmTypes>(
     on_state_update: &mut impl FnMut(EvmState),
     output: TxResultWithState<T>,
 ) -> TxResult<T> {
-    let TxResultWithState { result, mut pending_state, .. } = output;
+    let TxResultWithState { result, pending_state, .. } = output;
     block_state.commit_pending(&pending_state);
     let hook_state = if stream_state {
         // Apply the native output by reference, then transfer that same output to the hook.
         evm.overlay_db_mut().commit_pending(&pending_state);
-        evm.state_mut().recycle_detached_state(&mut pending_state);
         Some(pending_state)
     } else {
         evm.state_mut().set_pending_state(pending_state);
